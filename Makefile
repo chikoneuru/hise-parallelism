@@ -6,7 +6,7 @@ VENV ?= .venv
 PY   ?= $(VENV)/bin/python
 PIP  ?= $(VENV)/bin/pip
 
-.PHONY: venv install dev test lint smoke up down logs exp01 exp02 exp03 clean
+.PHONY: venv install dev test lint smoke up down logs exp01 exp02 exp03 probe-nvml clean
 
 venv:
 	python3 -m venv $(VENV)
@@ -45,6 +45,9 @@ exp02:
 
 exp03:
 	$(PY) experiments/exp03_elastic_reconfig.py
+
+probe-nvml:
+	$(PY) experiments/probe_nvml.py
 
 clean:
 	rm -rf .pytest_cache .mypy_cache .ruff_cache build dist *.egg-info

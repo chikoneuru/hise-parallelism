@@ -31,12 +31,14 @@ dependencies = [
 [project.optional-dependencies]
 rl = ["stable-baselines3>=2.3", "gymnasium>=0.29"]
 energy-api = ["requests>=2.31"]
+gpu = ["nvidia-ml-py>=12.0"]
 docker = ["docker>=7.0"]
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
   "ruff>=0.4",
   "mypy>=1.10",
+  "nvidia-ml-py>=12.0",
 ]
 
 [project.scripts]
