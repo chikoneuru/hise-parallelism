@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hise-redis
+  namespace: hise
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: hise-redis}
+  template:
+    metadata:
+      labels: {app: hise-redis}
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports: [{containerPort: 6379}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hise-redis
+  namespace: hise
+spec:
+  selector: {app: hise-redis}
+  ports:
+    - {port: 6379, targetPort: 6379}
