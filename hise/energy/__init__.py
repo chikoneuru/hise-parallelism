@@ -3,6 +3,7 @@ from hise.energy.carbon_trace import CarbonTrace, load_csv_trace, synthetic_sola
 from hise.energy.policy import (
     EnergyDecision,
     MPCPolicy,
+    PowerAwareRulePolicy,
     RuleBasedPolicy,
 )
 from hise.energy.telemetry import (
@@ -20,6 +21,7 @@ __all__ = [
     "FakeWorker",
     "MPCPolicy",
     "NvmlTelemetrySource",
+    "PowerAwareRulePolicy",
     "RuleBasedPolicy",
     "TelemetrySource",
     "WorkerTelemetry",
