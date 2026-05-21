@@ -227,18 +227,34 @@ def incremental_partition(
 
     link_map: dict[int, LinkSpec] = {lk.src_stage: lk for lk in links}
 
+    # Rebuild `previous` against the CURRENT layers + stages before using its bottleneck
+    # as a baseline. Its stored stage_exec_time may be stale if the layer set or stages
+    # changed since `previous` was computed; comparing against stale values would let the
+    # function return `previous` unchanged with mismatched stage_layers for current n.
+    prev_valid = (
+        all(0 <= c < n - 1 for c in prev_cuts)
+        and all(prev_cuts[i] < prev_cuts[i + 1] for i in range(len(prev_cuts) - 1))
+    )
+    if prev_valid:
+        try:
+            best = _build_partition(layers, stages, link_map, tuple(prev_cuts), K, num_microbatches)
+            best_bottleneck = max(best.stage_exec_time.values())
+        except RuntimeError:
+            best, best_bottleneck = previous, math.inf
+    else:
+        best, best_bottleneck = previous, math.inf
+
     ranges: list[range] = []
     for c_idx, c_val in enumerate(prev_cuts):
         lo = max(c_idx, c_val - boundary_window)
         hi = min(n - (K - 1 - c_idx), c_val + boundary_window)
         ranges.append(range(lo, hi + 1))
 
-    best = previous
-    best_bottleneck = max(previous.stage_exec_time.values()) if previous.stage_exec_time else math.inf
-
     for candidate_cuts in itertools.product(*ranges):
         if not all(candidate_cuts[i] < candidate_cuts[i + 1] for i in range(len(candidate_cuts) - 1)):
             continue
+        if candidate_cuts == tuple(prev_cuts):
+            continue  # already evaluated as baseline above
         try:
             p = _build_partition(layers, stages, link_map, candidate_cuts, K, num_microbatches)
         except RuntimeError:

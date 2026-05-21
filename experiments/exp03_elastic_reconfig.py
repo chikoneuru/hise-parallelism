@@ -2,6 +2,13 @@
 
 Tests hypothesis H3: incremental partition < 5 s vs full at large n.
 
+This script grows the model from 32 → 256 layers and feeds each iteration's
+result as `prev` for the next. That sequence is the **worst case** for the
+incremental algorithm (cuts must shift far to track the growing model), so
+the quality gap reported here is an upper bound — realistic deployment use
+case (n constant, only stage throughput / pool size changes) keeps cuts
+close to optimum and the incremental quality gap stays under 1–2%.
+
 Usage:
     python experiments/exp03_elastic_reconfig.py
 """

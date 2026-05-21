@@ -140,6 +140,37 @@ def test_incremental_k4() -> None:
     assert incr.sigma_exec <= full.sigma_exec + 1e-9
 
 
+def test_incremental_rebuilds_prev_against_current_layers() -> None:
+    """Regression: when `previous` was computed on a different layer set, its stored
+    stage_layers and stage_exec_time are stale. The returned Partition must cover the
+    *current* layer count, never the stale layer count from the previous call."""
+    prev_layers = _toy_model(12)
+    prev = partition_pipeline(prev_layers, _stages_k3(), _links_k3())
+    assert sum(len(prev.stage_layers[s]) for s in range(3)) == 12
+
+    # Grow the model to 24 layers and call incremental with the small-n prev.
+    new_layers = _toy_model(24)
+    incr = incremental_partition(prev, new_layers, _stages_k3(), _links_k3(), boundary_window=3)
+
+    # The returned partition must cover all 24 layers — not the stale 12.
+    total_layers = sum(len(incr.stage_layers[s]) for s in range(3))
+    assert total_layers == 24, f"expected 24 layers across stages, got {total_layers}"
+
+    # Cuts must be valid for the new layer count (each cut in [0, n-2]).
+    assert all(0 <= c < 23 for c in incr.cuts)
+
+    # stage_exec_time must be recomputed against new_layers, not copied from prev.
+    # Verify by reconstructing from incr.cuts and confirming match.
+    from hise.parallel.partitioner import _build_partition
+    link_map = {lk.src_stage: lk for lk in _links_k3()}
+    rebuilt = _build_partition(new_layers, _stages_k3(), link_map, incr.cuts, 3, 1)
+    for s in range(3):
+        assert abs(incr.stage_exec_time[s] - rebuilt.stage_exec_time[s]) < 1e-12, (
+            f"stage {s} exec_time stale: incr={incr.stage_exec_time[s]} "
+            f"vs fresh={rebuilt.stage_exec_time[s]}"
+        )
+
+
 # --- Edge cases ---
 
 def test_rejects_missing_link() -> None:
