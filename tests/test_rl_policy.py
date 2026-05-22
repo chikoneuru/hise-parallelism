@@ -158,7 +158,7 @@ def test_policy_construction_validates_bounds() -> None:
 
 
 def test_policy_decide_raises_without_model() -> None:
-    """Pre-Tuần-4 default: no model loaded → decide() raises with clear message."""
+    """Pre-training default: no model loaded → decide() raises with clear message."""
     policy = PPOScalingPolicy(min_gpus=1, max_gpus=8)
     obs = PPOObservation(
         training_progress=0.5, gpu_fraction=0.5, power_fraction=0.5,
