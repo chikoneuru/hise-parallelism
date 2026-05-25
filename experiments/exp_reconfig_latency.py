@@ -110,7 +110,6 @@ def run_scenario(scenario: DriftScenario,
     current = partition_before
     incremental_steps = 0
     fallback_fired = False
-    fallback_score = None
     incremental_wall_s = 0.0
     fallback_wall_s = 0.0
 
@@ -129,7 +128,6 @@ def run_scenario(scenario: DriftScenario,
             current = partition_pipeline(scenario.layers_after, scenario.stages,
                                           scenario.links, objective="bottleneck")
             fallback_wall_s = time.monotonic() - t0
-            fallback_score = max(current.stage_exec_time.values())
             break
         # Safety stop in case the test workload happens to converge incrementally.
         if incremental_steps > patience + 5:
