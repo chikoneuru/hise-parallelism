@@ -26,6 +26,7 @@ from rich.console import Console
 from rich.table import Table
 
 from experiments.exp_joint_vs_stacked import evaluate_workload
+from hise.parallel.joint_partitioner import ThrottleCurve
 from hise.parallel.partitioner import (
     LayerProfile,
     LinkSpec,
@@ -166,6 +167,7 @@ def sweep_cell(
     voltage_alpha: float,
     throttle_min: float,
     throttle_granularity: int,
+    throttle_curve: ThrottleCurve | None = None,
 ) -> list[CellResult]:
     links = [LinkSpec(s, s + 1, 1e18, 0.0) for s in range(len(stages) - 1)]
     bot = partition_pipeline(layers, stages, links, objective="bottleneck")
@@ -180,6 +182,7 @@ def sweep_cell(
             voltage_alpha=voltage_alpha,
             throttle_min=throttle_min,
             throttle_granularity=throttle_granularity,
+            throttle_curve=throttle_curve,
         )
         feasible = {r.name: (r.energy, r) for r in alloc_results if r.feasible}
         if "joint" not in feasible:
@@ -217,6 +220,14 @@ def run(args: argparse.Namespace) -> None:
     hw_keys = args.hardware or list(HARDWARE_PROFILES)
     t_floor_mults = args.t_floor_multipliers
 
+    throttle_curve: ThrottleCurve | None = None
+    if args.pareto_json:
+        throttle_curve = ThrottleCurve.from_pareto_json(args.pareto_json)
+        console.print(
+            f"[bold]Empirical mode[/]: loaded {len(throttle_curve.points)} "
+            f"throttle points from {args.pareto_json}"
+        )
+
     all_results: list[CellResult] = []
     for mk in model_keys:
         if mk not in MODELS:
@@ -231,6 +242,7 @@ def run(args: argparse.Namespace) -> None:
                 voltage_alpha=args.voltage_alpha,
                 throttle_min=args.throttle_min,
                 throttle_granularity=args.throttle_granularity,
+                throttle_curve=throttle_curve,
             )
             all_results.extend(rows)
 
@@ -333,6 +345,16 @@ def main() -> None:
     parser.add_argument("--voltage-alpha", type=float, default=2.0)
     parser.add_argument("--throttle-min", type=float, default=0.5)
     parser.add_argument("--throttle-granularity", type=int, default=11)
+    parser.add_argument(
+        "--pareto-json",
+        type=str,
+        default=None,
+        help=(
+            "Path to an exp_hardware_pareto.py JSON file. When given, the sweep "
+            "uses the empirical throttle curve instead of the parametric "
+            "voltage-alpha model; the alpha/min/granularity flags become ignored."
+        ),
+    )
     parser.add_argument("--acceptance-gap-pct", type=float, default=5.0)
     args = parser.parse_args()
     run(args)

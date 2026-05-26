@@ -21,12 +21,33 @@ Reduces to existing primitives at parameter boundaries:
 
 Complexity: O(n² · K · M) time, O(n · K) space, where M =
 ``throttle_granularity``.
+
+Two throttle models are supported:
+
+* **Parametric (default)** — closed-form ``P' = P · r^α``, parameterised
+  by ``voltage_alpha``. The original analytic surrogate used by the T6
+  proof. ``α ≥ 1`` makes the energy curve convex.
+* **Empirical curve** — caller passes a measured Pareto frontier as a
+  ``ThrottleCurve`` (typically built from a power-cap DVFS sweep such
+  as ``exp_hardware_pareto.py``). The DP replaces ``r^α``-style scaling
+  with the measured ``(time_scale, energy_scale)`` per throttle level,
+  so the optimiser sees the real U-shaped energy-per-iter curve that
+  real hardware exhibits (Zeus NSDI'23 reports the same shape across
+  A40, V100, RTX6000, P100).
+
+The empirical mode preserves the DP's correctness argument (principle of
+optimality only needs each stage's cost to depend on the stage's local
+``(cut, throttle)`` choice — both throttle models satisfy that). The
+parametric T6 strong-form witness no longer applies to empirical curves;
+the gap depends on the measured curve's shape.
 """
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from hise.parallel.partitioner import (
     LayerProfile,
@@ -36,6 +57,109 @@ from hise.parallel.partitioner import (
     _comp_time,
     _exec_time,
 )
+
+
+@dataclass(frozen=True)
+class ThrottleCurve:
+    """Empirical throttle curve from a real-hardware DVFS sweep.
+
+    Each point maps a throttle ratio ``r ∈ (0, 1]`` (= measured cap /
+    max cap) to:
+
+      - ``time_scale``: ``t_throttled / t_baseline`` ≥ 1. The baseline
+        is the ``r = 1.0`` measurement.
+      - ``energy_scale``: ``E_per_iter(r) / E_per_iter(r=1.0)``. Can be
+        below 1 (energy savings) or above 1 (U-shape overshoot).
+
+    The ``r = 1.0`` entry is required (it defines the baseline). Other
+    ratios are typically ``cap_w / max_cap_w`` from the sweep.
+
+    Use ``ThrottleCurve.from_pareto_json`` to construct from an
+    ``exp_hardware_pareto.py`` JSON output. Use ``ThrottleCurve.from_alpha``
+    to round-trip a parametric curve as an empirical lookup (handy for
+    backward-compat tests).
+    """
+
+    points: tuple[tuple[float, float, float], ...]
+    """Sorted by throttle ratio ascending: ``((r, time_scale, energy_scale), ...)``."""
+
+    def __post_init__(self) -> None:
+        if not self.points:
+            raise ValueError("ThrottleCurve requires at least one point")
+        rs = [p[0] for p in self.points]
+        if any(r <= 0.0 for r in rs):
+            raise ValueError(f"throttle ratios must be > 0, got {rs}")
+        if 1.0 not in rs and not any(abs(r - 1.0) < 1e-9 for r in rs):
+            raise ValueError(
+                f"ThrottleCurve must include r=1.0 baseline; got ratios {rs}"
+            )
+        for i in range(1, len(rs)):
+            if rs[i] <= rs[i - 1]:
+                raise ValueError(
+                    f"ThrottleCurve points must be sorted ascending in r; got {rs}"
+                )
+
+    def ratios(self) -> tuple[float, ...]:
+        return tuple(p[0] for p in self.points)
+
+    def time_scale(self, r: float) -> float:
+        for ratio, t_scale, _ in self.points:
+            if abs(ratio - r) < 1e-9:
+                return t_scale
+        raise KeyError(f"throttle ratio {r} not in curve; available {self.ratios()}")
+
+    def energy_scale(self, r: float) -> float:
+        for ratio, _, e_scale in self.points:
+            if abs(ratio - r) < 1e-9:
+                return e_scale
+        raise KeyError(f"throttle ratio {r} not in curve; available {self.ratios()}")
+
+    @classmethod
+    def from_alpha(
+        cls,
+        voltage_alpha: float,
+        throttle_min: float = 0.5,
+        granularity: int = 8,
+    ) -> ThrottleCurve:
+        """Sample the parametric ``r^α`` model at the given grid. Useful for
+        regression-by-construction: a partitioner run with this curve must
+        match a run with ``voltage_alpha=...`` and the matching grid."""
+        if voltage_alpha < 1.0:
+            raise ValueError(f"voltage_alpha must be >= 1, got {voltage_alpha}")
+        ratios = _build_throttle_set(throttle_min, granularity)
+        points: list[tuple[float, float, float]] = []
+        for r in ratios:
+            time_scale = 1.0 / r
+            energy_scale = r ** (voltage_alpha - 1.0)
+            points.append((r, time_scale, energy_scale))
+        return cls(points=tuple(points))
+
+    @classmethod
+    def from_pareto_json(cls, path: str | Path) -> ThrottleCurve:
+        """Load a ``ThrottleCurve`` from an ``exp_hardware_pareto.py`` JSON file.
+
+        Expects keys ``rows`` with entries ``cap_w_observed``,
+        ``wall_seconds``, ``avg_power_w``. The throttle ratio is
+        ``cap_w_observed / max(cap_w_observed)``; ``time_scale`` is
+        derived from ``wall_seconds`` normalised to the r=1.0 entry;
+        ``energy_scale`` from ``avg_power_w * wall_seconds`` similarly.
+        """
+        raw = json.loads(Path(path).read_text())
+        rows = raw["rows"]
+        if not rows:
+            raise ValueError(f"no rows in {path}")
+        max_cap = max(r["cap_w_observed"] for r in rows)
+        baseline = max(rows, key=lambda r: r["cap_w_observed"])
+        t_base = baseline["wall_seconds"]
+        e_base = baseline["avg_power_w"] * baseline["wall_seconds"]
+        points: list[tuple[float, float, float]] = []
+        for row in rows:
+            r = row["cap_w_observed"] / max_cap
+            t_scale = row["wall_seconds"] / t_base
+            e_scale = (row["avg_power_w"] * row["wall_seconds"]) / e_base
+            points.append((r, t_scale, e_scale))
+        points.sort(key=lambda p: p[0])
+        return cls(points=tuple(points))
 
 
 @dataclass(frozen=True)
@@ -90,6 +214,7 @@ def joint_partition(
     voltage_alpha: float = 2.0,
     throttle_min: float = 0.5,
     throttle_granularity: int = 8,
+    throttle_curve: ThrottleCurve | None = None,
 ) -> JointPlan:
     """Joint optimiser over (cuts, throttle vector).
 
@@ -102,15 +227,21 @@ def joint_partition(
             1/throughput_floor_iters_per_s``; every joint plan satisfies
             ``max_s T_s/r_s ≤ T_floor``. Lower values relax the floor and
             grant the optimiser more room to throttle.
-        voltage_alpha: power-frequency scaling exponent. 2.0 ≈ quadratic
-            (NVIDIA conservative bound), 3.0 ≈ cubic. Must be ≥ 1; at
-            α=1 the throttle has no energy effect.
-        throttle_min: hardware-imposed minimum throttle. 1.0 forbids any
-            throttling and reduces the optimiser to a pure energy-
-            objective partitioner.
-        throttle_granularity: discretisation of [throttle_min, 1.0].
-            Higher values approach the continuous optimum at linear time
-            cost.
+        voltage_alpha: power-frequency scaling exponent for the
+            parametric model. 2.0 ≈ quadratic (NVIDIA conservative
+            bound), 3.0 ≈ cubic. Must be ≥ 1. Ignored when
+            ``throttle_curve`` is supplied.
+        throttle_min: hardware-imposed minimum throttle for the
+            parametric model. Ignored when ``throttle_curve`` is
+            supplied — the curve already encodes the legal range.
+        throttle_granularity: discretisation of [throttle_min, 1.0] for
+            the parametric model. Ignored when ``throttle_curve`` is
+            supplied.
+        throttle_curve: optional empirical Pareto frontier from a
+            real-hardware DVFS sweep. When provided, the DP replaces the
+            parametric ``r^α`` model with the measured
+            ``(time_scale, energy_scale)`` per throttle ratio. See
+            ``ThrottleCurve.from_pareto_json``.
 
     Returns:
         ``JointPlan``. If the constraints cannot be satisfied, returns a
@@ -121,14 +252,15 @@ def joint_partition(
         raise ValueError(
             f"throughput_floor_iters_per_s must be > 0, got {throughput_floor_iters_per_s}"
         )
-    if voltage_alpha < 1.0:
-        raise ValueError(f"voltage_alpha must be >= 1, got {voltage_alpha}")
-    if not 0.0 < throttle_min <= 1.0:
-        raise ValueError(f"throttle_min must be in (0, 1], got {throttle_min}")
-    if throttle_granularity < 1:
-        raise ValueError(
-            f"throttle_granularity must be >= 1, got {throttle_granularity}"
-        )
+    if throttle_curve is None:
+        if voltage_alpha < 1.0:
+            raise ValueError(f"voltage_alpha must be >= 1, got {voltage_alpha}")
+        if not 0.0 < throttle_min <= 1.0:
+            raise ValueError(f"throttle_min must be in (0, 1], got {throttle_min}")
+        if throttle_granularity < 1:
+            raise ValueError(
+                f"throttle_granularity must be >= 1, got {throttle_granularity}"
+            )
 
     n = len(layers)
     K = len(stages)
@@ -137,7 +269,23 @@ def joint_partition(
     if n < K:
         raise ValueError(f"Need at least {K} layers for {K} stages.")
 
-    R = _build_throttle_set(throttle_min, throttle_granularity)
+    if throttle_curve is not None:
+        R = throttle_curve.ratios()
+
+        def t_mul(r: float) -> float:
+            return throttle_curve.time_scale(r)
+
+        def e_mul(r: float) -> float:
+            return throttle_curve.energy_scale(r)
+    else:
+        R = _build_throttle_set(throttle_min, throttle_granularity)
+
+        def t_mul(r: float) -> float:
+            return 1.0 / r
+
+        def e_mul(r: float) -> float:
+            return r ** (voltage_alpha - 1.0)
+
     T_floor = 1.0 / throughput_floor_iters_per_s
 
     link_map: dict[int, LinkSpec] = {lk.src_stage: lk for lk in links}
@@ -186,14 +334,20 @@ def joint_partition(
         for r in R:
             if r <= 0.0:
                 continue
-            t_throttled = t / r
+            t_mul_r = t_mul(r)
+            t_throttled = t * t_mul_r
             if t_throttled > t_floor_tol:
                 continue
             if max(prev_max, t_throttled) > t_floor_tol:
                 continue
-            if p * (r ** voltage_alpha) > p_cap:
+            energy_factor = e_mul(r)
+            # Average power at throttle = baseline power × (energy_scale / time_scale).
+            # Parametric model: p · r^α / r = p · r^(α-1) · (1/r)... wait, p · r^α (uniform).
+            # In α form: e_mul=r^(α-1), t_mul=1/r → avg_power = p · r^α (matches original).
+            avg_power = p * energy_factor / t_mul_r
+            if avg_power > p_cap:
                 continue
-            e_delta = p * (r ** (voltage_alpha - 1)) * t
+            e_delta = p * energy_factor * t
             if best is None or e_delta < best[0]:
                 best = (e_delta, t_throttled, r)
         return best
@@ -280,7 +434,7 @@ def joint_partition(
         end = boundaries[s + 1]
         stage_layers[s] = tuple(range(start, end + 1))
         t = seg_exec(s, start, end)
-        stage_exec_time[s] = t / throttles[s]
+        stage_exec_time[s] = t * t_mul(throttles[s])
 
     pipeline_time_s = max(stage_exec_time.values())
 

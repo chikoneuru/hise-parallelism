@@ -32,6 +32,7 @@ from rich.console import Console
 from rich.table import Table
 
 from hise.parallel.joint_partitioner import (
+    ThrottleCurve,
     _build_throttle_set,
     joint_partition,
 )
@@ -85,14 +86,27 @@ def _partition_energy_under_throttle(
     stages: list[StageSpec],
     throttle: tuple[float, ...],
     voltage_alpha: float,
+    throttle_curve: ThrottleCurve | None = None,
 ) -> tuple[float, float]:
-    """E(c, r) and pipeline_time = max_s T_s(c) / r_s."""
+    """E(c, r) and pipeline_time = max_s T_s(c) / r_s.
+
+    When ``throttle_curve`` is provided the parametric ``r^(α-1)`` and
+    ``1/r`` factors are replaced by the curve's measured scales — keeps
+    the non-joint baselines apples-to-apples with the joint allocator's
+    empirical mode.
+    """
     e = 0.0
     t_max = -math.inf
     for s, t in partition.stage_exec_time.items():
         r = throttle[s]
-        e += stages[s].power_draw_w * (r ** (voltage_alpha - 1)) * t
-        t_max = max(t_max, t / r)
+        if throttle_curve is None:
+            e_scale = r ** (voltage_alpha - 1)
+            t_scale = 1.0 / r
+        else:
+            e_scale = throttle_curve.energy_scale(r)
+            t_scale = throttle_curve.time_scale(r)
+        e += stages[s].power_draw_w * e_scale * t
+        t_max = max(t_max, t * t_scale)
     return e, t_max
 
 
@@ -129,9 +143,17 @@ def evaluate_workload(
     voltage_alpha: float,
     throttle_min: float,
     throttle_granularity: int,
+    throttle_curve: ThrottleCurve | None = None,
 ) -> list[AllocResult]:
-    """Run all five allocators against the same workload + T_floor."""
-    R = _build_throttle_set(throttle_min, throttle_granularity)
+    """Run all five allocators against the same workload + T_floor.
+
+    ``throttle_curve`` (optional) routes all five allocators through the
+    empirical Pareto frontier instead of the parametric ``r^α`` model.
+    """
+    if throttle_curve is not None:
+        R = throttle_curve.ratios()
+    else:
+        R = _build_throttle_set(throttle_min, throttle_granularity)
     t_floor = 1.0 / throughput_floor_iters_per_s
     results: list[AllocResult] = []
     n_stages = len(stages)
@@ -141,7 +163,9 @@ def evaluate_workload(
     en = partition_pipeline(layers, stages, links, objective="energy")
 
     for name, partition in (("bottleneck-only", bot), ("energy-only", en)):
-        e, tp = _partition_energy_under_throttle(partition, stages, unit_throttle, voltage_alpha)
+        e, tp = _partition_energy_under_throttle(
+            partition, stages, unit_throttle, voltage_alpha, throttle_curve,
+        )
         feasible = tp <= t_floor + 1e-9
         results.append(AllocResult(
             name=name, cuts=partition.cuts, throttle_factors=unit_throttle,
@@ -157,7 +181,9 @@ def evaluate_workload(
                 energy=math.inf, pipeline_time=math.inf, feasible=False,
             ))
             continue
-        e, tp = _partition_energy_under_throttle(partition, stages, proj, voltage_alpha)
+        e, tp = _partition_energy_under_throttle(
+            partition, stages, proj, voltage_alpha, throttle_curve,
+        )
         feasible = tp <= t_floor + 1e-9
         results.append(AllocResult(
             name=name, cuts=partition.cuts, throttle_factors=proj,
@@ -171,6 +197,7 @@ def evaluate_workload(
         voltage_alpha=voltage_alpha,
         throttle_min=throttle_min,
         throttle_granularity=throttle_granularity,
+        throttle_curve=throttle_curve,
     )
     results.append(AllocResult(
         name="joint",
