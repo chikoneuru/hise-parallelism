@@ -36,7 +36,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 
 from hise.admission.mss import EnergyBudgetMSS
-from hise.energy.policy import EnergyDecision, MPCPolicy, PowerAwareRulePolicy
+from hise.energy.policy import (
+    EnergyDecision,
+    MPCPolicy,
+    OnlinePrimalDualPolicy,
+    PowerAwareRulePolicy,
+)
 from hise.energy.telemetry import WorkerTelemetry
 from hise.orchestrator.deadline_selector import DeadlineFloor, DeadlineFloorSelector
 from hise.orchestrator.job import Job, JobState, JobStore
@@ -127,7 +132,7 @@ class EnergyAwareControlLoop:
     """
 
     job_store: JobStore
-    energy_policy: PowerAwareRulePolicy | MPCPolicy
+    energy_policy: PowerAwareRulePolicy | MPCPolicy | OnlinePrimalDualPolicy
     telemetry_source: Callable[[], Mapping[str, WorkerTelemetry]]
     runtime_model: SimpleRuntimeModel
     intensity_at_now: Callable[[], float] | None = None
@@ -156,6 +161,9 @@ class EnergyAwareControlLoop:
         if isinstance(self.energy_policy, MPCPolicy):
             forecast = self.intensity_forecast() if self.intensity_forecast else []
             return self.energy_policy.decide(current_gpus, forecast)
+        if isinstance(self.energy_policy, OnlinePrimalDualPolicy):
+            intensity = self.intensity_at_now() if self.intensity_at_now else 1.0
+            return self.energy_policy.decide(current_gpus, intensity)
         raise TypeError(f"Unsupported energy policy type: {type(self.energy_policy).__name__}")
 
     def _tracker_for(self, job_id: str, objective: str) -> StagnationTracker:

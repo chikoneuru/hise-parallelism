@@ -12,6 +12,7 @@ from hise.energy.carbon_trace import CarbonTrace, load_csv_trace, synthetic_sola
 from hise.energy.policy import (
     EnergyDecision,
     MPCPolicy,
+    OnlinePrimalDualPolicy,
     PowerAwareRulePolicy,
     RuleBasedPolicy,
 )
@@ -50,6 +51,7 @@ __all__ = [
     "MPCPolicy",
     "MultiSourceCarbonAggregator",
     "NvmlTelemetrySource",
+    "OnlinePrimalDualPolicy",
     "PPOAction",
     "PPOObservation",
     "PPOScalingPolicy",

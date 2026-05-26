@@ -16,6 +16,7 @@ A future ``RLPolicy`` (PPO via Stable-Baselines3) is scaffolded in ``rl_policy``
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
@@ -250,3 +251,122 @@ class MPCPolicy:
             f"{', reconfig penalty applied' if switched and has_penalty else ''})"
         )
         return EnergyDecision(best, reason=reason)
+
+
+@dataclass
+class OnlinePrimalDualPolicy:
+    """Online primal-dual scheduler with a deadline-throughput constraint.
+
+    Each step, given the live carbon intensity ``b_t``, the policy picks the
+    GPU count ``g*`` that minimises the per-step Lagrangian::
+
+        L_t(g) = E(g) · μ(g) · b_t  −  λ_t · μ(g)
+
+    where ``E(g)`` is energy-per-iter at allocation ``g`` (J / iter),
+    ``μ(g)`` is the resulting iteration rate (iter / s), and ``λ_t`` is the
+    running dual estimate for the deadline-throughput constraint. The dual
+    is updated by projected gradient ascent::
+
+        λ_{t+1} = max(0, λ_t + η · (target_iter_rate − μ(g*)))
+
+    so a streak of below-target throughput pushes ``λ`` upward until the
+    primal argmin selects a higher-throughput GPU count. The step size
+    ``η`` is calibrated to the running cost scale so ``λ`` converges within
+    ``O(√T)`` steps::
+
+        η = max_energy_estimate · intensity_scale / √T
+
+    Compared with ``MPCPolicy``: MPC needs a horizon forecast of ``b_t``;
+    primal-dual uses only the current sample plus its running multiplier,
+    so it is robust to non-stationary or unforecastable intensity. The
+    trade is a higher constant in the regret bound — see proofs §10.
+
+    Args:
+        min_gpus, max_gpus: action set ``[min_gpus, max_gpus]``.
+        throughput_per_gpu: ``μ(g)`` in iter/s.
+        energy_per_iter: ``E(g)`` in J/iter (or any consistent unit that
+            matches ``max_energy_estimate``).
+        target_iter_rate: deadline-induced throughput floor in iter/s.
+            Typically ``iters_remaining / deadline_seconds_remaining``
+            refreshed by the orchestrator each tick — but the policy
+            holds it constant across the calibration horizon so ``λ`` has
+            a stable target to chase.
+        horizon_steps: ``T`` used in the ``η`` calibration; should
+            reflect the number of decision steps over which ``λ`` is
+            expected to converge.
+        max_energy_estimate: upper bound on ``E(g) · μ(g)`` over the
+            action set; used to size ``η``.
+        intensity_scale: expected magnitude of ``b_t`` (mean carbon
+            intensity). Defaults to 1.0 — set to your trace mean when
+            running against gCO2/kWh traces.
+        eta: step size override. ``0.0`` (default) triggers the
+            calibration formula above.
+
+    Mutable state ``lambda_t`` evolves across ``decide`` calls — instantiate
+    one policy per job, not one shared across jobs.
+    """
+
+    min_gpus: int
+    max_gpus: int
+    throughput_per_gpu: Callable[[int], float]
+    energy_per_iter: Callable[[int], float]
+    target_iter_rate: float
+    horizon_steps: int
+    max_energy_estimate: float
+    intensity_scale: float = 1.0
+    eta: float = 0.0
+
+    lambda_t: float = field(default=0.0, init=False)
+
+    def __post_init__(self) -> None:
+        if self.min_gpus < 1:
+            raise ValueError(f"min_gpus must be >= 1, got {self.min_gpus}")
+        if self.max_gpus < self.min_gpus:
+            raise ValueError(
+                f"max_gpus ({self.max_gpus}) must be >= min_gpus ({self.min_gpus})"
+            )
+        if self.horizon_steps < 1:
+            raise ValueError(f"horizon_steps must be >= 1, got {self.horizon_steps}")
+        if self.target_iter_rate < 0:
+            raise ValueError(
+                f"target_iter_rate must be >= 0, got {self.target_iter_rate}"
+            )
+        if self.max_energy_estimate <= 0:
+            raise ValueError(
+                f"max_energy_estimate must be > 0, got {self.max_energy_estimate}"
+            )
+        if self.eta < 0:
+            raise ValueError(f"eta must be >= 0, got {self.eta}")
+        if self.eta == 0.0:
+            self.eta = (
+                self.max_energy_estimate
+                * self.intensity_scale
+                / max(1.0, math.sqrt(self.horizon_steps))
+            )
+
+    def decide(self, current_gpus: int, intensity_now: float) -> EnergyDecision:
+        """Pick ``argmin_g L_t(g)``, then update ``λ`` toward the target rate."""
+        # Primal argmin over the discrete action set.
+        best_gpus = self.min_gpus
+        best_score = math.inf
+        for g in range(self.min_gpus, self.max_gpus + 1):
+            mu = self.throughput_per_gpu(g)
+            e = self.energy_per_iter(g)
+            score = e * mu * intensity_now - self.lambda_t * mu
+            if score < best_score:
+                best_score = score
+                best_gpus = g
+
+        # Dual ascent — projected onto non-negative reals.
+        mu_chosen = self.throughput_per_gpu(best_gpus)
+        prev_lambda = self.lambda_t
+        self.lambda_t = max(
+            0.0,
+            self.lambda_t + self.eta * (self.target_iter_rate - mu_chosen),
+        )
+        reason = (
+            f"primal-dual choose {best_gpus} "
+            f"(score={best_score:.3f}, μ={mu_chosen:.3f}, "
+            f"target={self.target_iter_rate:.3f}, λ {prev_lambda:.3f}→{self.lambda_t:.3f})"
+        )
+        return EnergyDecision(best_gpus, reason=reason)
