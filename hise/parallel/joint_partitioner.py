@@ -173,6 +173,11 @@ def joint_partition(
 
     # Throttle search at a single transition: yields (energy_delta, max_t_over_r, r)
     # for each r ∈ R that survives (R), (P), (Θ-local) constraints.
+    # The relative tolerance on the (Θ) check absorbs the ulp-level drift that
+    # accumulates when T_floor is computed as 1/(1/T_max_bot) and T_s/r lands
+    # within a few ulps of T_floor at the active grid point.
+    t_floor_tol = T_floor * (1.0 + 1e-9)
+
     def best_local(stage_id: int, t: float, prev_max: float) -> tuple[float, float, float] | None:
         spec = stages[stage_id]
         p = spec.power_draw_w
@@ -182,9 +187,9 @@ def joint_partition(
             if r <= 0.0:
                 continue
             t_throttled = t / r
-            if t_throttled > T_floor:
+            if t_throttled > t_floor_tol:
                 continue
-            if max(prev_max, t_throttled) > T_floor:
+            if max(prev_max, t_throttled) > t_floor_tol:
                 continue
             if p * (r ** voltage_alpha) > p_cap:
                 continue
