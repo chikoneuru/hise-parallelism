@@ -1,0 +1,290 @@
+"""Joint pipeline partition and per-stage throttle co-design.
+
+Picks layer cuts `c = (c_1, …, c_{K-1})` and per-stage throttle factors
+`r = (r_0, …, r_{K-1}) ∈ [r_min, 1]^K` jointly, minimising per-iteration
+energy
+
+    E(π) = Σ_s P_s · r_s^{α-1} · T_s(c)
+
+subject to a hard throughput floor `max_s T_s(c)/r_s ≤ T_floor`,
+per-stage power cap `P_s · r_s^α ≤ P_s^{cap}`, segment memory fit, and the
+hardware throttle range `r ∈ [r_min, 1]`.
+
+Reduces to existing primitives at parameter boundaries:
+
+    throttle_min=1.0, throttle_granularity=1, throughput_floor → 0
+        ≡ partition_pipeline(objective="energy")
+    cuts fixed by caller (single-cell DP)
+        ≡ perseus_throttle on that partition
+    throttle_min=1.0 with cuts fixed at bottleneck-optimal
+        ≡ Perseus on bottleneck partition
+
+Complexity: O(n² · K · M) time, O(n · K) space, where M =
+``throttle_granularity``.
+"""
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+
+from hise.parallel.partitioner import (
+    LayerProfile,
+    LinkSpec,
+    StageSpec,
+    _comm_time,
+    _comp_time,
+    _exec_time,
+)
+
+
+@dataclass(frozen=True)
+class JointPlan:
+    """Joint partition-and-throttle plan over `K` pipeline stages.
+
+    ``stage_exec_time`` reports the *throttled* exec time `T_s/r_s`
+    (what the pipeline cycle sees). ``pipeline_time_s`` is the maximum
+    over all stages — the pipeline's steady-state cycle.
+    ``energy_per_iter`` is in Joules.
+
+    A plan with non-finite ``energy_per_iter`` indicates the problem was
+    infeasible under the supplied constraints; callers should check
+    :meth:`is_feasible` before consuming the other fields.
+    """
+
+    cuts: tuple[int, ...] = ()
+    throttle_factors: tuple[float, ...] = ()
+    stage_layers: dict[int, tuple[int, ...]] = field(default_factory=dict)
+    stage_exec_time: dict[int, float] = field(default_factory=dict)
+    energy_per_iter: float = math.inf
+    pipeline_time_s: float = math.inf
+    num_stages: int = 0
+
+    def is_feasible(self) -> bool:
+        return math.isfinite(self.energy_per_iter)
+
+
+def _build_throttle_set(throttle_min: float, granularity: int) -> tuple[float, ...]:
+    """Discretise the throttle interval [throttle_min, 1.0].
+
+    granularity == 1 yields a single value: 1.0 if throttle_min == 1.0,
+    otherwise throttle_min (the user is forcing a single off-1.0 throttle).
+    granularity >= 2 includes both endpoints; the top endpoint is pinned to
+    exactly 1.0 to avoid floating-point drift in equality comparisons.
+    """
+    if granularity == 1:
+        return (1.0 if throttle_min >= 1.0 else throttle_min,)
+    if throttle_min >= 1.0:
+        return (1.0,)
+    step = (1.0 - throttle_min) / (granularity - 1)
+    body = tuple(throttle_min + i * step for i in range(granularity - 1))
+    return body + (1.0,)
+
+
+def joint_partition(
+    layers: Sequence[LayerProfile],
+    stages: Sequence[StageSpec],
+    links: Sequence[LinkSpec],
+    *,
+    throughput_floor_iters_per_s: float,
+    voltage_alpha: float = 2.0,
+    throttle_min: float = 0.5,
+    throttle_granularity: int = 8,
+) -> JointPlan:
+    """Joint optimiser over (cuts, throttle vector).
+
+    Args:
+        layers: n LayerProfile objects, indexed 0..n-1.
+        stages: K StageSpec objects, ordered by stage_id 0..K-1.
+        links: K-1 LinkSpec objects for consecutive stage pairs.
+        throughput_floor_iters_per_s: minimum acceptable pipeline
+            throughput. The corresponding cycle ceiling is ``T_floor =
+            1/throughput_floor_iters_per_s``; every joint plan satisfies
+            ``max_s T_s/r_s ≤ T_floor``. Lower values relax the floor and
+            grant the optimiser more room to throttle.
+        voltage_alpha: power-frequency scaling exponent. 2.0 ≈ quadratic
+            (NVIDIA conservative bound), 3.0 ≈ cubic. Must be ≥ 1; at
+            α=1 the throttle has no energy effect.
+        throttle_min: hardware-imposed minimum throttle. 1.0 forbids any
+            throttling and reduces the optimiser to a pure energy-
+            objective partitioner.
+        throttle_granularity: discretisation of [throttle_min, 1.0].
+            Higher values approach the continuous optimum at linear time
+            cost.
+
+    Returns:
+        ``JointPlan``. If the constraints cannot be satisfied, returns a
+        plan with empty fields and ``energy_per_iter = inf``; callers
+        should check :meth:`JointPlan.is_feasible`.
+    """
+    if throughput_floor_iters_per_s <= 0:
+        raise ValueError(
+            f"throughput_floor_iters_per_s must be > 0, got {throughput_floor_iters_per_s}"
+        )
+    if voltage_alpha < 1.0:
+        raise ValueError(f"voltage_alpha must be >= 1, got {voltage_alpha}")
+    if not 0.0 < throttle_min <= 1.0:
+        raise ValueError(f"throttle_min must be in (0, 1], got {throttle_min}")
+    if throttle_granularity < 1:
+        raise ValueError(
+            f"throttle_granularity must be >= 1, got {throttle_granularity}"
+        )
+
+    n = len(layers)
+    K = len(stages)
+    if K < 1:
+        raise ValueError("Need at least 1 stage.")
+    if n < K:
+        raise ValueError(f"Need at least {K} layers for {K} stages.")
+
+    R = _build_throttle_set(throttle_min, throttle_granularity)
+    T_floor = 1.0 / throughput_floor_iters_per_s
+
+    link_map: dict[int, LinkSpec] = {lk.src_stage: lk for lk in links}
+    for s in range(K - 1):
+        if s not in link_map:
+            raise ValueError(f"Missing link from stage {s} to stage {s+1}.")
+
+    prefix_fwd = [0.0] * (n + 1)
+    prefix_bwd = [0.0] * (n + 1)
+    prefix_mem = [0] * (n + 1)
+    for i in range(n):
+        prefix_fwd[i + 1] = prefix_fwd[i] + layers[i].fwd_flops
+        prefix_bwd[i + 1] = prefix_bwd[i] + layers[i].bwd_flops
+        prefix_mem[i + 1] = prefix_mem[i] + layers[i].activation_bytes
+
+    def seg_exec(stage_id: int, start: int, end: int) -> float:
+        fwd = prefix_fwd[end + 1] - prefix_fwd[start]
+        bwd = prefix_bwd[end + 1] - prefix_bwd[start]
+        comp = _comp_time(stages[stage_id], fwd, bwd)
+        comm_in = 0.0
+        if stage_id > 0 and start > 0:
+            comm_in = _comm_time(
+                link_map[stage_id - 1], layers[start - 1].activation_bytes
+            )
+        comm_out = 0.0
+        if stage_id < K - 1:
+            comm_out = _comm_time(link_map[stage_id], layers[end].activation_bytes)
+        return _exec_time(comp, comm_out, comm_in)
+
+    def seg_feasible(stage_id: int, start: int, end: int) -> bool:
+        mem = prefix_mem[end + 1] - prefix_mem[start]
+        return mem <= stages[stage_id].memory_bytes
+
+    # Throttle search at a single transition: yields (energy_delta, max_t_over_r, r)
+    # for each r ∈ R that survives (R), (P), (Θ-local) constraints.
+    def best_local(stage_id: int, t: float, prev_max: float) -> tuple[float, float, float] | None:
+        spec = stages[stage_id]
+        p = spec.power_draw_w
+        p_cap = spec.power_cap_w
+        best: tuple[float, float, float] | None = None
+        for r in R:
+            if r <= 0.0:
+                continue
+            t_throttled = t / r
+            if t_throttled > T_floor:
+                continue
+            if max(prev_max, t_throttled) > T_floor:
+                continue
+            if p * (r ** voltage_alpha) > p_cap:
+                continue
+            e_delta = p * (r ** (voltage_alpha - 1)) * t
+            if best is None or e_delta < best[0]:
+                best = (e_delta, t_throttled, r)
+        return best
+
+    INF = float("inf")
+
+    # K=1: just throttle the single stage covering all layers.
+    if K == 1:
+        if not seg_feasible(0, 0, n - 1):
+            return JointPlan()
+        t = seg_exec(0, 0, n - 1)
+        local = best_local(0, t, 0.0)
+        if local is None:
+            return JointPlan()
+        e_delta, t_throttled, r = local
+        return JointPlan(
+            cuts=(),
+            throttle_factors=(r,),
+            stage_layers={0: tuple(range(n))},
+            stage_exec_time={0: t_throttled},
+            energy_per_iter=e_delta,
+            pipeline_time_s=t_throttled,
+            num_stages=1,
+        )
+
+    # dp[j][s] = (energy_to_here, max_throttled_exec_to_here, prev_i, prev_r)
+    dp: list[list[tuple[float, float, int, float]]] = [
+        [(INF, INF, -1, 0.0) for _ in range(K)] for _ in range(n)
+    ]
+
+    # Base case: stage 0 covers [0..j]
+    for j in range(n):
+        if not seg_feasible(0, 0, j):
+            continue
+        t = seg_exec(0, 0, j)
+        local = best_local(0, t, 0.0)
+        if local is None:
+            continue
+        e_delta, t_throttled, r = local
+        dp[j][0] = (e_delta, t_throttled, -1, r)
+
+    # Inductive: stages 1..K-1
+    for s in range(1, K):
+        for j in range(s, n):
+            best: tuple[float, float, int, float] = (INF, INF, -1, 0.0)
+            for i in range(s - 1, j):
+                prev_e, prev_max, _, _ = dp[i][s - 1]
+                if prev_e >= INF:
+                    continue
+                if not seg_feasible(s, i + 1, j):
+                    continue
+                t = seg_exec(s, i + 1, j)
+                local = best_local(s, t, prev_max)
+                if local is None:
+                    continue
+                e_delta, t_throttled, r = local
+                e_new = prev_e + e_delta
+                max_new = max(prev_max, t_throttled)
+                if e_new < best[0]:
+                    best = (e_new, max_new, i, r)
+            dp[j][s] = best
+
+    final_e, _, _, _ = dp[n - 1][K - 1]
+    if final_e >= INF:
+        return JointPlan()
+
+    # Backtrack: recover (cuts, throttle_factors) by walking dp[n-1][K-1] back.
+    cuts_list: list[int] = []
+    throttles: list[float] = [0.0] * K
+    j = n - 1
+    for s in range(K - 1, 0, -1):
+        _, _, prev_i, r = dp[j][s]
+        throttles[s] = r
+        cuts_list.append(prev_i)
+        j = prev_i
+    throttles[0] = dp[j][0][3]
+    cuts_list.reverse()
+
+    boundaries = [-1, *cuts_list, n - 1]
+    stage_layers: dict[int, tuple[int, ...]] = {}
+    stage_exec_time: dict[int, float] = {}
+    for s in range(K):
+        start = boundaries[s] + 1
+        end = boundaries[s + 1]
+        stage_layers[s] = tuple(range(start, end + 1))
+        t = seg_exec(s, start, end)
+        stage_exec_time[s] = t / throttles[s]
+
+    pipeline_time_s = max(stage_exec_time.values())
+
+    return JointPlan(
+        cuts=tuple(cuts_list),
+        throttle_factors=tuple(throttles),
+        stage_layers=stage_layers,
+        stage_exec_time=stage_exec_time,
+        energy_per_iter=final_e,
+        pipeline_time_s=pipeline_time_s,
+        num_stages=K,
+    )

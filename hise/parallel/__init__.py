@@ -7,6 +7,7 @@ from hise.parallel.inter_batch import (
     energy_weights_for_stage,
     weights_for_stage,
 )
+from hise.parallel.joint_partitioner import JointPlan, joint_partition
 from hise.parallel.partitioner import (
     LayerProfile,
     LinkSpec,
@@ -22,6 +23,7 @@ __all__ = [
     "EnergyAwareWRR",
     "HybridStrategy",
     "InterBatchScheduler",
+    "JointPlan",
     "LayerProfile",
     "LinkSpec",
     "Node",
@@ -31,6 +33,7 @@ __all__ = [
     "StagnationTracker",
     "energy_weights_for_stage",
     "incremental_partition",
+    "joint_partition",
     "partition_pipeline",
     "select_hybrid_strategy",
     "weights_for_stage",
