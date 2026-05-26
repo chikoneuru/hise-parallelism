@@ -40,6 +40,20 @@ class Job:
     def new(cls, **kwargs) -> Job:
         return cls(job_id=str(uuid.uuid4()), **kwargs)
 
+    def iters_remaining(self) -> int:
+        """Iterations still owed to finish this job. Clamped at zero."""
+        return max(0, self.iterations_target - self.iterations_done)
+
+    def deadline_seconds_remaining(self, now_seconds: float | None = None) -> float:
+        """Wall-clock seconds until this job's deadline.
+
+        Deadline anchored at ``submitted_at + deadline_s``. Returns 0.0 once
+        the deadline has passed so downstream allocators treat the job as
+        time-critical rather than negative-budget.
+        """
+        now = now_seconds if now_seconds is not None else time.time()
+        return max(0.0, self.submitted_at + self.deadline_s - now)
+
 
 class JobStore:
     """Thread-safe in-memory job store."""

@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from hise.admission.mss import EnergyBudgetMSS
 from hise.energy.policy import EnergyDecision, MPCPolicy, PowerAwareRulePolicy
 from hise.energy.telemetry import WorkerTelemetry
+from hise.orchestrator.deadline_selector import DeadlineFloor, DeadlineFloorSelector
 from hise.orchestrator.job import Job, JobState, JobStore
 from hise.parallel.partitioner import (
     LayerProfile,
@@ -93,6 +94,8 @@ class TickResult:
     strategies: dict[str, HybridStrategy] = field(default_factory=dict)
     partitions: dict[str, Partition] = field(default_factory=dict)
     fallbacks: dict[str, str] = field(default_factory=dict)   # job_id → reason
+    deadline_floors: dict[str, DeadlineFloor] = field(default_factory=dict)
+    deadline_overrides: dict[str, str] = field(default_factory=dict)   # job_id → reason
 
 
 @dataclass
@@ -133,6 +136,7 @@ class EnergyAwareControlLoop:
     stagnation_patience: int = 3
     cluster_size: int = 16
     pool_scale_fn: Callable[[str, int], None] | None = None
+    deadline_floor_selectors: dict[str, DeadlineFloorSelector] = field(default_factory=dict)
 
     _partitions: dict[str, Partition] = field(default_factory=dict, init=False, repr=False)
     _trackers: dict[str, StagnationTracker] = field(default_factory=dict, init=False, repr=False)
@@ -235,6 +239,20 @@ class EnergyAwareControlLoop:
             result.decisions[job.job_id] = decision
 
             target = max(1, decision.target_gpus)
+
+            selector = self.deadline_floor_selectors.get(job.job_id)
+            if selector is not None:
+                floor = selector.evaluate(
+                    iters_remaining=job.iters_remaining(),
+                    deadline_seconds_remaining=job.deadline_seconds_remaining(now),
+                )
+                result.deadline_floors[job.job_id] = floor
+                if target < floor.gpus:
+                    result.deadline_overrides[job.job_id] = (
+                        f"deadline floor lifted {target}→{floor.gpus} ({floor.reason})"
+                    )
+                    target = floor.gpus
+
             strategy = select_hybrid_strategy(target, self.runtime_model)
             result.strategies[job.job_id] = strategy
 
