@@ -111,17 +111,52 @@ def hise_threshold_mask(
     intensities: Sequence[float],
     threshold_multiplier: float = 1.10,
 ) -> tuple[int, ...]:
-    """HISE's current carbon-aware policy: pause if intensity > median × multiplier.
+    """HISE's offline-median carbon-aware policy: pause if intensity > median × multiplier.
 
-    Provided here so the comparison harness has a uniform interface across the
-    three policies. Pause fraction emerges from the trace + threshold combination
-    rather than being a knob.
+    Uses the median of the full ``intensities`` sequence as the reference
+    threshold. This implies offline knowledge of the trace and is only fair
+    against :func:`green_offline_optimal_mask`. For an apples-to-apples
+    comparison against :func:`green_online_percentile_mask`, use
+    :func:`hise_threshold_online_mask` instead.
     """
     if not intensities:
         return ()
     median = statistics.median(intensities)
     threshold = median * threshold_multiplier
     return tuple(0 if v > threshold else 1 for v in intensities)
+
+
+def hise_threshold_online_mask(
+    intensities: Sequence[float],
+    threshold_multiplier: float = 1.10,
+    window_size: int = 24,
+) -> tuple[int, ...]:
+    """Online rolling-median variant of :func:`hise_threshold_mask`.
+
+    Mirrors :func:`green_online_percentile_mask` in window cadence and
+    bootstrap behaviour, so HISE-threshold and GREEN-online are compared
+    on identical information sets (rolling ``window_size`` ticks, no
+    lookahead). At each tick ``t`` the decision threshold is
+    ``median(intensities[t - window_size + 1 : t + 1]) ×
+    threshold_multiplier`` and the tick pauses iff the current intensity
+    exceeds it. With fewer than two samples in the window, defaults to
+    active (bootstrap).
+    """
+    if window_size <= 0:
+        raise ValueError(f"window_size must be > 0, got {window_size}")
+    n = len(intensities)
+    if n == 0:
+        return ()
+    mask: list[int] = []
+    for t in range(n):
+        window_start = max(0, t - window_size + 1)
+        window = intensities[window_start:t + 1]
+        if len(window) <= 1:
+            mask.append(1)
+            continue
+        threshold = statistics.median(window) * threshold_multiplier
+        mask.append(0 if intensities[t] > threshold else 1)
+    return tuple(mask)
 
 
 def pause_fraction(mask: Sequence[int]) -> float:

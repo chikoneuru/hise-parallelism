@@ -1,44 +1,42 @@
 """H5-C policy comparison: HISE-threshold vs GREEN-temporal (NSDI'25).
 
-Closes Extension 2 of the pre-paper review: the original
-``exp_h5c_real_trace.py`` compares HISE's threshold-pause policy against
-``constant-N=1``. That comparison shows the *upper bound* on savings but does
-not isolate HISE's contribution from prior carbon-aware schedulers. This
-harness adds two GREEN-style temporal-shift baselines:
+Apples-to-apples comparison of carbon-aware temporal-shift policies on the
+parametric 16-zone trace. Four policies are evaluated per zone and seed:
 
-  - **GREEN-offline-optimal** — oracle that knows the full trace and pauses
-    the top-K highest-intensity ticks. Theoretical max savings.
-  - **GREEN-online-percentile** — rolling 24h window estimator that decides
-    pause/active per tick based on percentile of recent history. Realistic
-    online policy mirroring the GREEN paper's deployment.
+  - **HISE-offline** — full-trace median as the reference threshold.
+    Requires offline knowledge; only fair against ``green-offline``.
+  - **HISE-online** — rolling 24 h median as the reference threshold.
+    Same information set as ``green-online``; the headline fairness fix.
+  - **GREEN-offline** (oracle) — knows the full trace and pauses the
+    top-K highest-intensity ticks at the matched pause fraction.
+  - **GREEN-online-percentile** — rolling 24 h percentile estimator at
+    the matched pause fraction.
 
 To make the comparison fair, the two GREEN flavours are run with a pause
-budget matched to the pause fraction HISE-threshold *emerges with* on each
-zone — so all three policies pause the same total share of ticks per zone.
-What differs is *which* ticks they pause: GREEN-offline picks optimally,
-GREEN-online picks based on rolling history, HISE-threshold picks based on
-the all-time median.
+budget matched to the pause fraction the corresponding HISE flavour
+*emerges with* on each zone. The headline gap is **HISE-online minus
+GREEN-online**: both see the same rolling 24 h window with no offline
+lookahead, so any savings difference reflects the policy decision rule
+(median-threshold vs percentile-pause) rather than information advantage.
 
-For each (zone, policy) we report:
-    - active ticks (count) and pause fraction
-    - total kWh assumed (rectangular integration under the Zeus reference
-      power model: 210 W active, 0 W when paused)
-    - total emissions gCO2 = sum_t (1 - mask_t) * 0 + mask_t * P * tick_seconds * intensity_t
-
-The headline metric is *emissions relative to constant-N=1*; HISE vs GREEN
-gap is reported as the second-order quality of the policy.
+For each (zone, seed, policy) we report active ticks, pause fraction,
+total kWh under the Zeus reference power model (210 W active, 0 W when
+paused), and total emissions in grams of CO2. Savings are reported
+relative to a ``constant-N=1`` reference that runs every tick.
 
 Usage::
 
     python -m experiments.exp_h5c_vs_green --zones DE US-CA FR GB NO ZA \\
-        --days 14 --out artifacts/h5c_vs_green.json
+        --days 14 --seeds 0 1 2 --out artifacts/h5c_vs_green.json
 """
 from __future__ import annotations
 
 import argparse
 import json
 import statistics
+from collections import defaultdict
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from rich.console import Console
 from rich.table import Table
@@ -47,6 +45,7 @@ from experiments.baselines.green import (
     green_offline_optimal_mask,
     green_online_percentile_mask,
     hise_threshold_mask,
+    hise_threshold_online_mask,
     pause_fraction,
 )
 from hise.energy.carbon_trace import published_grid_trace
@@ -58,6 +57,7 @@ ACTIVE_POWER_W = 210.0
 @dataclass(frozen=True)
 class PolicyResult:
     zone: str
+    seed: int
     policy: str
     active_ticks: int
     pause_fraction: float
@@ -70,11 +70,7 @@ def _evaluate_mask(
     intensities: list[float],
     sample_minutes: int,
 ) -> tuple[float, float]:
-    """(energy_kwh, emissions_g) under the Zeus reference model.
-
-    energy contribution per active tick = ACTIVE_POWER_W × tick_seconds / 3.6e6
-    emission contribution = energy × intensity_at_tick
-    """
+    """(energy_kwh, emissions_g) under the Zeus reference model."""
     tick_seconds = sample_minutes * 60.0
     base_kwh = ACTIVE_POWER_W * tick_seconds / 3_600_000.0
     energy_kwh = 0.0
@@ -86,38 +82,54 @@ def _evaluate_mask(
     return energy_kwh, emissions_g
 
 
-def run_zone(zone: str, days: int, sample_minutes: int, seed: int,
-             hise_threshold_multiplier: float) -> list[PolicyResult]:
+def run_zone_seed(
+    zone: str,
+    seed: int,
+    days: int,
+    sample_minutes: int,
+    hise_threshold_multiplier: float,
+) -> list[PolicyResult]:
     trace = published_grid_trace(zone, days=days, sample_minutes=sample_minutes, seed=seed)
     intensities = list(trace.intensities)
     n = len(intensities)
+    window_ticks = max(1, 24 * 60 // sample_minutes)
 
-    # Constant-N=1 reference: all active.
+    # Reference: all active.
     const_mask = (1,) * n
     const_e, const_em = _evaluate_mask(const_mask, intensities, sample_minutes)
 
-    # HISE threshold: pause if intensity > median × multiplier.
-    hise_mask = hise_threshold_mask(intensities, hise_threshold_multiplier)
-    hise_pf = pause_fraction(hise_mask)
-    hise_e, hise_em = _evaluate_mask(hise_mask, intensities, sample_minutes)
+    # HISE-offline: full-trace median threshold. Offline information.
+    hise_off_mask = hise_threshold_mask(intensities, hise_threshold_multiplier)
+    hise_off_pf = pause_fraction(hise_off_mask)
+    hise_off_e, hise_off_em = _evaluate_mask(hise_off_mask, intensities, sample_minutes)
 
-    # GREEN-offline: oracle, matched pause budget to HISE.
-    green_off_mask = green_offline_optimal_mask(intensities, pause_fraction=hise_pf)
+    # HISE-online: rolling 24 h median threshold. Same horizon as GREEN-online.
+    hise_on_mask = hise_threshold_online_mask(
+        intensities, hise_threshold_multiplier, window_size=window_ticks,
+    )
+    hise_on_pf = pause_fraction(hise_on_mask)
+    hise_on_e, hise_on_em = _evaluate_mask(hise_on_mask, intensities, sample_minutes)
+
+    # GREEN-offline at HISE-offline's pause budget (legacy reference; expected
+    # to be byte-identical to HISE-offline by construction).
+    green_off_mask = green_offline_optimal_mask(intensities, pause_fraction=hise_off_pf)
     green_off_e, green_off_em = _evaluate_mask(green_off_mask, intensities, sample_minutes)
 
-    # GREEN-online: rolling 24h window, matched pause budget to HISE.
-    # Window is in ticks; for hourly data 24 ticks = 24h.
+    # GREEN-online at HISE-online's emergent pause budget. The fair head-to-head.
     green_on_mask = green_online_percentile_mask(
-        intensities, pause_fraction=hise_pf, window_size=24 * 60 // sample_minutes,
+        intensities, pause_fraction=hise_on_pf, window_size=window_ticks,
     )
     green_on_e, green_on_em = _evaluate_mask(green_on_mask, intensities, sample_minutes)
 
     return [
-        PolicyResult(zone, "constant-N", n, 0.0, const_e, const_em),
-        PolicyResult(zone, "hise-threshold", sum(hise_mask), hise_pf, hise_e, hise_em),
-        PolicyResult(zone, "green-offline", sum(green_off_mask),
+        PolicyResult(zone, seed, "constant-N", n, 0.0, const_e, const_em),
+        PolicyResult(zone, seed, "hise-offline", sum(hise_off_mask), hise_off_pf,
+                     hise_off_e, hise_off_em),
+        PolicyResult(zone, seed, "hise-online", sum(hise_on_mask), hise_on_pf,
+                     hise_on_e, hise_on_em),
+        PolicyResult(zone, seed, "green-offline", sum(green_off_mask),
                      pause_fraction(green_off_mask), green_off_e, green_off_em),
-        PolicyResult(zone, "green-online", sum(green_on_mask),
+        PolicyResult(zone, seed, "green-online", sum(green_on_mask),
                      pause_fraction(green_on_mask), green_on_e, green_on_em),
     ]
 
@@ -137,91 +149,128 @@ def main() -> int:
     )
     parser.add_argument("--days", type=int, default=14)
     parser.add_argument("--sample-minutes", type=int, default=60)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--hise-threshold-multiplier", type=float, default=1.10)
     parser.add_argument("--out", default="artifacts/h5c_vs_green.json")
     args = parser.parse_args()
 
     console = Console()
     console.print(
-        f"[bold]H5-C policy comparison[/]: {len(args.zones)} zones × {args.days} days × "
-        f"{args.sample_minutes}-min cadence; HISE threshold = median × {args.hise_threshold_multiplier}"
+        f"[bold]H5-C policy comparison[/]: {len(args.zones)} zones × "
+        f"{len(args.seeds)} seeds × {args.days} days × {args.sample_minutes}-min cadence; "
+        f"HISE threshold = median × {args.hise_threshold_multiplier}"
     )
 
     all_results: list[PolicyResult] = []
     for zone in args.zones:
-        all_results.extend(run_zone(zone, args.days, args.sample_minutes, args.seed,
-                                    args.hise_threshold_multiplier))
+        for seed in args.seeds:
+            all_results.extend(run_zone_seed(
+                zone, seed, args.days, args.sample_minutes,
+                args.hise_threshold_multiplier,
+            ))
 
-    # Per-zone table.
-    table = Table(title="Per-zone savings vs constant-N=1 (matched pause-budget across HISE/GREEN)")
+    # Aggregate per (zone, policy): mean savings across seeds.
+    by_zone_policy_seed: dict[tuple[str, str, int], PolicyResult] = {
+        (r.zone, r.policy, r.seed): r for r in all_results
+    }
+
+    def saves_for(zone: str, policy: str) -> list[float]:
+        return [
+            _pct_savings(
+                by_zone_policy_seed[(zone, policy, s)].emissions_g,
+                by_zone_policy_seed[(zone, "constant-N", s)].emissions_g,
+            )
+            for s in args.seeds
+        ]
+
+    # Fair head-to-head: HISE-online vs GREEN-online.
+    table = Table(title="Per-zone savings vs constant-N=1 (3 seeds; HISE-online vs GREEN-online is the fair head-to-head)")
     table.add_column("zone")
-    table.add_column("pause %", justify="right")
-    table.add_column("HISE Δ %", justify="right")
-    table.add_column("GREEN-online Δ %", justify="right")
-    table.add_column("GREEN-offline (oracle) Δ %", justify="right")
-    table.add_column("HISE-vs-online (pp)", justify="right")
+    table.add_column("HISE-on pause%", justify="right")
+    table.add_column("HISE-on Δ% (μ±σ)", justify="right")
+    table.add_column("GREEN-on Δ% (μ±σ)", justify="right")
+    table.add_column("HISE-off Δ% (μ)", justify="right")
+    table.add_column("GREEN-off Δ% (μ)", justify="right")
+    table.add_column("HISE-on − GREEN-on (pp, μ)", justify="right")
 
-    by_zone: dict[str, dict[str, PolicyResult]] = {}
-    for r in all_results:
-        by_zone.setdefault(r.zone, {})[r.policy] = r
-
-    hise_pp_deltas: list[float] = []
+    fair_pp_deltas: list[float] = []
+    fair_wins = 0
     for zone in args.zones:
-        z = by_zone[zone]
-        const_em = z["constant-N"].emissions_g
-        hise_em = z["hise-threshold"].emissions_g
-        green_off_em = z["green-offline"].emissions_g
-        green_on_em = z["green-online"].emissions_g
-        hise_save = _pct_savings(hise_em, const_em)
-        green_off_save = _pct_savings(green_off_em, const_em)
-        green_on_save = _pct_savings(green_on_em, const_em)
-        # Quality delta: HISE-online gap (positive means HISE saves *more* than GREEN-online).
-        pp_delta = hise_save - green_on_save
-        hise_pp_deltas.append(pp_delta)
+        h_on = saves_for(zone, "hise-online")
+        g_on = saves_for(zone, "green-online")
+        h_off = saves_for(zone, "hise-offline")
+        g_off = saves_for(zone, "green-offline")
+        pp = [h - g for h, g in zip(h_on, g_on, strict=True)]
+        mean_pp = statistics.mean(pp)
+        fair_pp_deltas.append(mean_pp)
+        if mean_pp >= 0:
+            fair_wins += 1
+        pause_pcts = [
+            by_zone_policy_seed[(zone, "hise-online", s)].pause_fraction * 100
+            for s in args.seeds
+        ]
+
+        def fmt(values: list[float]) -> str:
+            mu = statistics.mean(values)
+            if len(values) >= 2:
+                sd = statistics.stdev(values)
+                return f"{mu:+.2f}±{sd:.2f}"
+            return f"{mu:+.2f}"
+
         table.add_row(
             zone,
-            f"{z['hise-threshold'].pause_fraction * 100:.1f}%",
-            f"{hise_save:.2f}%",
-            f"{green_on_save:.2f}%",
-            f"{green_off_save:.2f}%",
-            f"{pp_delta:+.2f}",
+            f"{statistics.mean(pause_pcts):.1f}%",
+            fmt(h_on),
+            fmt(g_on),
+            f"{statistics.mean(h_off):+.2f}",
+            f"{statistics.mean(g_off):+.2f}",
+            f"{mean_pp:+.2f}",
         )
     console.print(table)
 
-    # Aggregate roll-up.
-    summary = Table(title="Aggregate across zones")
+    summary = Table(title="Aggregate across zones (fair head-to-head: HISE-online vs GREEN-online)")
     summary.add_column("metric")
     summary.add_column("value", justify="right")
-    hise_saves = [
-        _pct_savings(by_zone[z]["hise-threshold"].emissions_g, by_zone[z]["constant-N"].emissions_g)
-        for z in args.zones
-    ]
-    green_on_saves = [
-        _pct_savings(by_zone[z]["green-online"].emissions_g, by_zone[z]["constant-N"].emissions_g)
-        for z in args.zones
-    ]
-    green_off_saves = [
-        _pct_savings(by_zone[z]["green-offline"].emissions_g, by_zone[z]["constant-N"].emissions_g)
-        for z in args.zones
-    ]
-    summary.add_row("HISE mean savings", f"{statistics.mean(hise_saves):.2f}%")
-    summary.add_row("GREEN-online mean savings", f"{statistics.mean(green_on_saves):.2f}%")
+
+    def grand_mean(policy: str) -> float:
+        return statistics.mean(
+            v for z in args.zones for v in saves_for(z, policy)
+        )
+
+    grand_pp = statistics.mean(fair_pp_deltas)
+    summary.add_row("HISE-online mean savings", f"{grand_mean('hise-online'):+.2f}%")
+    summary.add_row("GREEN-online mean savings", f"{grand_mean('green-online'):+.2f}%")
+    summary.add_row("HISE-offline (uses full trace) mean savings",
+                    f"{grand_mean('hise-offline'):+.2f}%")
     summary.add_row("GREEN-offline (oracle) mean savings",
-                    f"{statistics.mean(green_off_saves):.2f}%")
-    summary.add_row("HISE vs GREEN-online gap (pp)", f"{statistics.mean(hise_pp_deltas):+.2f}")
-    summary.add_row("HISE vs GREEN-offline gap (pp)",
-                    f"{statistics.mean(hise_saves) - statistics.mean(green_off_saves):+.2f}")
-    summary.add_row("zones where HISE ≥ GREEN-online",
-                    f"{sum(1 for d in hise_pp_deltas if d >= 0)}/{len(hise_pp_deltas)}")
+                    f"{grand_mean('green-offline'):+.2f}%")
+    summary.add_row("HISE-online − GREEN-online gap (pp)", f"{grand_pp:+.2f}")
+    summary.add_row("zones where HISE-online ≥ GREEN-online",
+                    f"{fair_wins}/{len(args.zones)}")
+    summary.add_row("HISE-offline ≡ GREEN-offline (by construction)",
+                    "yes — same matched-budget set")
     console.print(summary)
 
-    from pathlib import Path
+    # Pairwise per-seed gaps for downstream stats.
+    per_seed_gaps: dict[str, list[float]] = defaultdict(list)
+    for zone in args.zones:
+        for s in args.seeds:
+            h = _pct_savings(
+                by_zone_policy_seed[(zone, "hise-online", s)].emissions_g,
+                by_zone_policy_seed[(zone, "constant-N", s)].emissions_g,
+            )
+            g = _pct_savings(
+                by_zone_policy_seed[(zone, "green-online", s)].emissions_g,
+                by_zone_policy_seed[(zone, "constant-N", s)].emissions_g,
+            )
+            per_seed_gaps[zone].append(h - g)
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps({
         "args": vars(args),
         "results": [asdict(r) for r in all_results],
+        "per_zone_fair_pp_gap_per_seed": dict(per_seed_gaps),
     }, indent=2))
     console.print(f"\n[dim]wrote {out}[/]")
     return 0
