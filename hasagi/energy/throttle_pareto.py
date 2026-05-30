@@ -175,9 +175,19 @@ def pareto(
         total_iters=total_iters, window_s=window_s, schedule_g=schedule_g,
         clean_cap_w=full, threshold_g=threshold_g,
     )
+    eco_common = dict(common)
+    eco_common["clean_cap_w"] = throttle_cap   # energy-optimal cap in EVERY window
     return {
         "always_on": simulate_policy(
             profile, name="always-on", dirty_cap_w=full, **common,
+        ),
+        # Carbon-BLIND efficiency baseline: run at the energy-optimal cap always.
+        # The gap between this and always-on is the U-curve efficiency win that a
+        # carbon-unaware operator already gets; the gap between this and
+        # throttle/pause is the part attributable to carbon-AWARENESS.
+        "always_on_eco": simulate_policy(
+            profile, name=f"always-on@{throttle_cap:.0f}W(eco)", dirty_cap_w=throttle_cap,
+            **eco_common,
         ),
         "pause": simulate_policy(
             profile, name="pause", dirty_cap_w=None,

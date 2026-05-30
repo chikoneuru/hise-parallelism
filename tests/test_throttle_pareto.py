@@ -79,10 +79,25 @@ def test_throttle_between_alwayson_and_pause() -> None:
 
 def test_pareto_orders_carbon_and_makespan() -> None:
     res = pareto(_PROFILE, total_iters=1000, window_s=10.0, schedule_g=_SCHED, threshold_g=500.0)
-    assert set(res) == {"always_on", "pause", "throttle"}
+    assert set(res) == {"always_on", "always_on_eco", "pause", "throttle"}
     # pause: least carbon, most makespan; always-on: most carbon, least makespan
     assert res["pause"].total_carbon_g < res["throttle"].total_carbon_g < res["always_on"].total_carbon_g
     assert res["pause"].makespan_s > res["always_on"].makespan_s
     # all complete the same work
     for r in res.values():
         assert r.iters >= 1000
+
+
+def test_eco_baseline_is_carbon_blind_efficiency() -> None:
+    """always-on@eco runs the energy-optimal cap throughout: lower carbon than
+    always-on@full (the U-curve efficiency win) but a longer makespan, and it is
+    carbon-BLIND (same cap regardless of intensity)."""
+    res = pareto(_PROFILE, total_iters=1000, window_s=10.0, schedule_g=_SCHED, threshold_g=500.0)
+    eco = res["always_on_eco"]
+    full = res["always_on"]
+    # eco (200 W, 4.5 J/it) is leaner than full (300 W, 5.4 J/it) → less carbon
+    assert eco.total_carbon_g < full.total_carbon_g
+    # ... but slower (40 vs 50 it/s) → longer makespan
+    assert eco.makespan_s > full.makespan_s
+    # eco never idles (it is always-on, just at a leaner cap)
+    assert eco.idle_carbon_g == 0.0

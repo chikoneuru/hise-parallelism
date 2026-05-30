@@ -49,6 +49,11 @@ def run(args: argparse.Namespace) -> int:
     always_on = simulate_policy(
         profile, name="always-on", clean_cap_w=full, dirty_cap_w=full, **common,
     )
+    # Carbon-BLIND efficiency baseline: energy-optimal cap in every window.
+    eco = simulate_policy(
+        profile, name=f"always-on@{throttle_cap:.0f}W(eco)", clean_cap_w=throttle_cap,
+        dirty_cap_w=throttle_cap, **common,
+    )
     throttle = simulate_policy(
         profile, name=f"throttle@{throttle_cap:.0f}W", clean_cap_w=full,
         dirty_cap_w=throttle_cap, **common,
@@ -79,8 +84,9 @@ def run(args: argparse.Namespace) -> int:
             "rel_carbon_pct_vs_alwayson": rel, "makespan_delta_s": dmk,
         }
 
-    console.print("[bold]Policy comparison (vs always-on)[/]:")
+    console.print("[bold]Policy comparison (vs always-on@full)[/]:")
     line(always_on)
+    line(eco)
     line(throttle)
     line(pause_by_regime["reallocated"])
     line(pause_by_regime["dedicated"])
@@ -88,6 +94,26 @@ def run(args: argparse.Namespace) -> int:
         "[dim]throttle keeps training at a leaner cap during dirty windows "
         "(no pause/resume); pause defers work and pays resume + regime idle.[/]"
     )
+
+    # Decompose the throttle saving into a carbon-BLIND efficiency part (just
+    # using the energy-optimal cap) and the carbon-AWARENESS part (timing the
+    # leanness to dirty windows). If awareness is small, most of the "carbon-
+    # aware" win is really energy efficiency a carbon-unaware operator gets too.
+    base_g = always_on.total_carbon_g
+    if base_g > 0:
+        eff_pct = 100.0 * (base_g - eco.total_carbon_g) / base_g
+        throttle_total_pct = 100.0 * (base_g - throttle.total_carbon_g) / base_g
+        aware_pct = throttle_total_pct - eff_pct
+        console.print(
+            f"[bold]Decomposition of throttle's {throttle_total_pct:+.1f}% vs always-on@full[/]: "
+            f"efficiency (eco cap, carbon-blind) {eff_pct:+.1f}% + carbon-awareness "
+            f"(dirty-window timing) {aware_pct:+.1f}%."
+        )
+        results["_decomposition"] = {
+            "throttle_total_pct": throttle_total_pct,
+            "efficiency_pct_carbon_blind": eff_pct,
+            "carbon_awareness_pct": aware_pct,
+        }
 
     if args.out:
         out = Path(args.out)
