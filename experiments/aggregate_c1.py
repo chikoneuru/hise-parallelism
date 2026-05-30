@@ -24,9 +24,12 @@ from rich.console import Console
 from rich.table import Table
 
 from hise.stats import (
-    cohens_d,
+    cluster_means,
+    clustered_bootstrap_ci,
+    clustered_permutation_pvalue,
     effect_size_tag,
     holm_bonferroni,
+    one_sample_standardized_effect,
     paired_bootstrap_ci,
     paired_permutation_pvalue,
 )
@@ -151,37 +154,57 @@ def main() -> int:
         )
     console.print(table)
 
-    pooled_carbon = [v for zs in per_zone_carbon_deltas.values() for v in zs]
-    pooled_energy = [v for zs in per_zone_energy_deltas.values() for v in zs]
-    pooled_top1 = [v for zs in per_zone_top1_deltas.values() for v in zs]
+    # The zone is the unit of statistical replication: the 3 seeds inside a
+    # zone share an identical synthetic diurnal phase (carbon_trace.py fixes
+    # start_dt for every zone) and so are near-replicates, not independent
+    # draws. Pooling all 48 (zone, seed) cells as i.i.d. understates the CI and
+    # over-states significance. Headline inference therefore CLUSTERS by zone.
+    carbon_by_zone = [per_zone_carbon_deltas[z] for z in zones]
+    energy_by_zone = [per_zone_energy_deltas[z] for z in zones]
+    top1_by_zone = [per_zone_top1_deltas[z] for z in zones]
     pooled_jct = [j for zs in per_zone_jct_throttle.values() for j, _ in zs]
 
-    pc_m, pc_lo, pc_hi = paired_bootstrap_ci(pooled_carbon, n_boot=N_BOOT, rng=rng)
-    pe_m, pe_lo, pe_hi = paired_bootstrap_ci(pooled_energy, n_boot=N_BOOT, rng=rng)
-    pt_m, pt_lo, pt_hi = paired_bootstrap_ci(pooled_top1, n_boot=N_BOOT, rng=rng)
-    p_pool = paired_permutation_pvalue(
-        pooled_carbon, [0.0] * len(pooled_carbon), n_perm=N_PERM, rng=rng,
-    )
-    d_pool = cohens_d(pooled_carbon, [0.0] * len(pooled_carbon))
+    pc_m, pc_lo, pc_hi = clustered_bootstrap_ci(carbon_by_zone, n_boot=N_BOOT, rng=rng)
+    pe_m, pe_lo, pe_hi = clustered_bootstrap_ci(energy_by_zone, n_boot=N_BOOT, rng=rng)
+    pt_m, pt_lo, pt_hi = clustered_bootstrap_ci(top1_by_zone, n_boot=N_BOOT, rng=rng)
+    p_clustered = clustered_permutation_pvalue(carbon_by_zone, n_perm=N_PERM, rng=rng)
+    d_clustered = one_sample_standardized_effect(cluster_means(carbon_by_zone))
 
-    summary = Table(title="Global pooled (16 zones x 3 seeds = 48 paired observations)")
+    # Naive flat-pooled numbers kept ONLY for transparency / comparison; they
+    # are NOT the headline because the 48 cells are not independent.
+    flat_carbon = [v for zs in carbon_by_zone for v in zs]
+    fc_m, fc_lo, fc_hi = paired_bootstrap_ci(flat_carbon, n_boot=N_BOOT, rng=rng)
+
+    summary = Table(title="Global, zone-clustered (16 zones = replication unit; 3 seeds/zone averaged)")
     summary.add_column("metric")
     summary.add_column("value", justify="right")
     summary.add_row("Delta carbon mean (%)", f"{pc_m:+.3f} [{pc_lo:+.3f}, {pc_hi:+.3f}]")
     summary.add_row("Delta energy mean (%)", f"{pe_m:+.3f} [{pe_lo:+.3f}, {pe_hi:+.3f}]")
     summary.add_row("Delta top-1 mean (pp)", f"{pt_m:+.4f} [{pt_lo:+.4f}, {pt_hi:+.4f}]")
     summary.add_row("Mean JCT penalty (%)", f"{statistics.mean(pooled_jct):.3f}")
-    summary.add_row("Cohen's d (carbon vs zero)", f"{d_pool:+.3f} ({effect_size_tag(d_pool)})")
-    summary.add_row("Paired-permutation p", f"{p_pool:.5f}")
+    summary.add_row("One-sample effect (mean/sd over zones)", f"{d_clustered:+.3f} ({effect_size_tag(d_clustered)})")
+    summary.add_row("Cluster-permutation p (exact, 16 zones)", f"{p_clustered:.2e}")
     summary.add_row("Zones with carbon delta < 0", f"{sum(1 for r in rows if r['carbon_mean_pct'] < 0)}/{len(rows)}")
-    summary.add_row("Holm-rejected zones", f"{sum(1 for r in rows if r['holm_rejected'])}/{len(rows)}")
+    summary.add_row(
+        "Per-zone Holm-rejected",
+        f"{sum(1 for r in rows if r['holm_rejected'])}/{len(rows)} "
+        f"(n=3/zone: per-zone permutation floors at 0.25, so none are rejectable)",
+    )
+    summary.add_row("[dim]naive flat-pooled CI (n=48, NOT headline)[/]", f"{fc_m:+.3f} [{fc_lo:+.3f}, {fc_hi:+.3f}]")
     console.print(summary)
 
     out = {
         "args": {"src": str(args.src), "n_boot": N_BOOT, "n_perm": N_PERM, "alpha": ALPHA},
+        "inference_note": (
+            "Headline inference clusters by zone (16 clusters); the 3 seeds per "
+            "zone are averaged because they share one synthetic diurnal phase and "
+            "are not independent. Per-zone p-values use exact sign-flip enumeration "
+            "(floor 0.25 at n=3) and are reported for completeness only."
+        ),
         "rows": rows,
-        "pooled": {
-            "n": len(pooled_carbon),
+        "pooled_clustered": {
+            "n_clusters": len(zones),
+            "seeds_per_cluster": len(seeds),
             "carbon_mean_pct": pc_m,
             "carbon_ci": [pc_lo, pc_hi],
             "energy_mean_pct": pe_m,
@@ -189,8 +212,13 @@ def main() -> int:
             "top1_mean_pp": pt_m,
             "top1_ci": [pt_lo, pt_hi],
             "jct_mean_pct": statistics.mean(pooled_jct),
-            "cohens_d_carbon": d_pool,
-            "p_value": p_pool,
+            "one_sample_effect_carbon": d_clustered,
+            "cluster_permutation_p": p_clustered,
+        },
+        "naive_flat_pooled_carbon_NOT_headline": {
+            "n": len(flat_carbon),
+            "carbon_mean_pct": fc_m,
+            "carbon_ci": [fc_lo, fc_hi],
         },
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)

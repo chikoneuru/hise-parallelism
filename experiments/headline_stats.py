@@ -43,9 +43,13 @@ from rich.console import Console
 from rich.table import Table
 
 from hise.stats import (
+    cluster_means,
+    clustered_bootstrap_ci,
+    clustered_permutation_pvalue,
     cohens_d,
     effect_size_tag,
     holm_bonferroni,
+    one_sample_standardized_effect,
     paired_bootstrap_ci,
     paired_permutation_pvalue,
 )
@@ -97,23 +101,40 @@ def _analyse_h5c(path: Path) -> dict[str, Any]:
         row["holm_rejected"] = rej
         row["holm_alpha"] = adj
 
-    # Aggregate: pool every (zone, seed) gap into a single CI.
-    all_gaps = [g for diffs in per_zone_gaps.values() for g in diffs]
-    mean_a, lo_a, hi_a = paired_bootstrap_ci(all_gaps, n_boot=N_BOOT, rng=rng)
-    p_pool = paired_permutation_pvalue(
-        all_gaps, [0.0] * len(all_gaps), n_perm=N_PERM, rng=rng,
-    )
+    # Headline aggregate CLUSTERS by zone: the seeds inside a zone share one
+    # synthetic diurnal phase and are not independent, so a flat pool over every
+    # (zone, seed) gap would understate the CI. The cluster unit is the zone.
+    gaps_by_zone = [per_zone_gaps[z] for z in zones]
+    mean_a, lo_a, hi_a = clustered_bootstrap_ci(gaps_by_zone, n_boot=N_BOOT, rng=rng)
+    p_clustered = clustered_permutation_pvalue(gaps_by_zone, n_perm=N_PERM, rng=rng)
+    d_clustered = one_sample_standardized_effect(cluster_means(gaps_by_zone))
+
+    # Naive flat pool kept for transparency only (NOT the headline).
+    all_gaps = [g for diffs in gaps_by_zone for g in diffs]
+    fmean, flo, fhi = paired_bootstrap_ci(all_gaps, n_boot=N_BOOT, rng=rng)
 
     return {
         "name": "H5-C HISE-online vs GREEN-online (pp gap, per zone)",
         "alpha": ALPHA,
+        "inference_note": (
+            "Headline is the zone-clustered estimate; per-zone p uses exact "
+            "sign-flip enumeration (floor 0.25 at n=3). Flat pool shown for "
+            "transparency only."
+        ),
         "rows": rows,
-        "pooled": {
-            "n": len(all_gaps),
+        "pooled_clustered": {
+            "n_clusters": len(zones),
             "mean_pp_gap": mean_a,
             "ci_lo": lo_a,
             "ci_hi": hi_a,
-            "p_value": p_pool,
+            "cluster_permutation_p": p_clustered,
+            "one_sample_effect": d_clustered,
+        },
+        "naive_flat_pooled_NOT_headline": {
+            "n": len(all_gaps),
+            "mean_pp_gap": fmean,
+            "ci_lo": flo,
+            "ci_hi": fhi,
         },
     }
 
@@ -315,12 +336,18 @@ def _render(report: dict[str, Any], console: Console) -> None:
                 values.append(str(v))
         table.add_row(*values)
     console.print(table)
-    if "pooled" in report:
-        p = report["pooled"]
+    if "pooled_clustered" in report:
+        p = report["pooled_clustered"]
+        flat = report.get("naive_flat_pooled_NOT_headline", {})
         console.print(
-            f"[bold]Pooled across all rows[/]: n={p['n']}, "
+            f"[bold]Zone-clustered[/]: {p['n_clusters']} zones, "
             f"mean pp gap = {p['mean_pp_gap']:+.3f} "
-            f"[{p['ci_lo']:+.3f}, {p['ci_hi']:+.3f}], p={p['p_value']:.4f}"
+            f"[{p['ci_lo']:+.3f}, {p['ci_hi']:+.3f}], "
+            f"exact cluster-perm p={p['cluster_permutation_p']:.2e}, "
+            f"effect={p['one_sample_effect']:+.2f}"
+            + (f"  [dim](naive flat pool: {flat['mean_pp_gap']:+.3f} "
+               f"[{flat['ci_lo']:+.3f}, {flat['ci_hi']:+.3f}], n={flat['n']})[/]"
+               if flat else "")
         )
 
 

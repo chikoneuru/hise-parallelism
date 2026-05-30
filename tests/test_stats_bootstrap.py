@@ -3,14 +3,19 @@ from __future__ import annotations
 
 import math
 import random
+import statistics
 
 import pytest
 
 from hise.stats import (
     bootstrap_mean_ci,
+    cluster_means,
+    clustered_bootstrap_ci,
+    clustered_permutation_pvalue,
     cohens_d,
     effect_size_tag,
     holm_bonferroni,
+    one_sample_standardized_effect,
     paired_bootstrap_ci,
     paired_permutation_pvalue,
 )
@@ -131,6 +136,63 @@ def test_paired_permutation_no_effect_high_p() -> None:
     # Trick: a − b = diffs; mean = 0, so we expect p = 1 by the zero-mean guard.
     p = paired_permutation_pvalue(a, b, n_perm=2000, rng=random.Random(3))
     assert p == 1.0
+
+
+def test_paired_permutation_n3_cannot_floor_below_exact_minimum() -> None:
+    """Regression: at n=3 the exact two-sided permutation floor is 2/8=0.25.
+
+    A consistently-signed triple has exactly two extreme assignments (identity
+    and full-flip), so p MUST be 0.25 and can never be driven to ~1/(n_perm+1)
+    by a floating-point tie mismatch. This pins the bug that previously floored
+    several n=3 carbon zones to 0.0001 and produced false Holm rejections.
+    """
+    for triple in ([-9.27, -8.10, -10.4], [-16.22, -15.48, -17.32], [2.0, 2.0, 2.0]):
+        a = list(triple)
+        b = [0.0] * 3
+        p = paired_permutation_pvalue(a, b, n_perm=10_000, rng=random.Random(0))
+        assert p == pytest.approx(0.25), f"{triple} -> {p}"
+
+
+def test_paired_permutation_exact_is_deterministic_for_small_n() -> None:
+    """Below exact_max_n the result is exact and independent of rng / n_perm."""
+    a = [3.0, 1.0, 2.0, 4.0]
+    b = [0.0] * 4
+    p1 = paired_permutation_pvalue(a, b, n_perm=500, rng=random.Random(1))
+    p2 = paired_permutation_pvalue(a, b, n_perm=9999, rng=random.Random(99))
+    assert p1 == p2  # exact enumeration ignores the Monte-Carlo knobs
+
+
+# --- clustered inference ---
+
+
+def test_cluster_means_drops_empty_and_averages() -> None:
+    assert cluster_means([[2.0, 4.0], [10.0], []]) == [3.0, 10.0]
+
+
+def test_clustered_ci_wider_than_flat_pool_under_within_cluster_dependence() -> None:
+    """Clustering by the replication unit must not be narrower than a naive
+    flat pool when seeds within a cluster are near-replicates."""
+    by_cluster = [[-10.0, -10.1, -9.9], [-2.0, -2.1, -1.9], [-16.0, -16.1, -15.9],
+                  [-3.0, -3.1, -2.9], [-11.0, -11.1, -10.9]]
+    flat = [v for c in by_cluster for v in c]
+    _, c_lo, c_hi = clustered_bootstrap_ci(by_cluster, n_boot=4000, rng=random.Random(0))
+    _, f_lo, f_hi = paired_bootstrap_ci(flat, n_boot=4000, rng=random.Random(0))
+    assert (c_hi - c_lo) >= (f_hi - f_lo)
+
+
+def test_clustered_permutation_all_negative_clusters_is_exact_floor() -> None:
+    """16 same-sign clusters → exact two-sided p = 2 / 2**16."""
+    by_cluster = [[-1.0 - 0.1 * i] for i in range(16)]
+    p = clustered_permutation_pvalue(by_cluster)
+    assert p == pytest.approx(2 / (1 << 16))
+
+
+def test_one_sample_effect_uses_real_dispersion_not_zero_control() -> None:
+    """mean/sd over clusters; finite and not inflated by a zero-variance control."""
+    means = [-10.0, -12.0, -8.0, -11.0, -9.0]
+    d = one_sample_standardized_effect(means)
+    assert d == pytest.approx(statistics.mean(means) / statistics.stdev(means))
+    assert math.isnan(one_sample_standardized_effect([3.0]))
 
 
 # --- holm_bonferroni ---
