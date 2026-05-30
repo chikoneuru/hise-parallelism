@@ -7,6 +7,7 @@ from hasagi.energy.throttle_pareto import (
     CapPoint,
     PowerCapProfile,
     pareto,
+    simulate_masked_policy,
     simulate_policy,
 )
 
@@ -101,3 +102,72 @@ def test_eco_baseline_is_carbon_blind_efficiency() -> None:
     assert eco.makespan_s > full.makespan_s
     # eco never idles (it is always-on, just at a leaner cap)
     assert eco.idle_carbon_g == 0.0
+
+
+# --- masked policy: an external decision rule drives the measured substrate ---
+
+def test_masked_all_active_equals_always_on() -> None:
+    """A mask that is active in every window is exactly always-on@full."""
+    full = simulate_policy(_PROFILE, name="always-on", clean_cap_w=300.0, dirty_cap_w=300.0, **_KW)
+    masked = simulate_masked_policy(
+        _PROFILE, name="masked-on", active_mask=[1, 1], full_cap_w=300.0,
+        total_iters=1000, window_s=10.0, schedule_g=_SCHED,
+    )
+    assert masked.total_carbon_g == pytest.approx(full.total_carbon_g)
+    assert masked.makespan_s == pytest.approx(full.makespan_s)
+    assert masked.iters == full.iters
+
+
+def test_masked_pause_matches_threshold_pause() -> None:
+    """Masking off the dirty window (pause) reproduces the threshold pause policy
+    when the mask flags exactly the windows above the threshold."""
+    thr = simulate_policy(
+        _PROFILE, name="pause", clean_cap_w=300.0, dirty_cap_w=None,
+        idle_power_w=50.0, resume_energy_kwh=1e-4, **_KW,
+    )
+    # schedule is [clean=200, dirty=800]; threshold 500 → dirty window is index 1.
+    masked = simulate_masked_policy(
+        _PROFILE, name="pause", active_mask=[1, 0], full_cap_w=300.0, off_cap_w=None,
+        idle_power_w=50.0, resume_energy_kwh=1e-4,
+        total_iters=1000, window_s=10.0, schedule_g=_SCHED,
+    )
+    assert masked.total_carbon_g == pytest.approx(thr.total_carbon_g)
+    assert masked.idle_carbon_g == pytest.approx(thr.idle_carbon_g)
+    assert masked.resume_carbon_g == pytest.approx(thr.resume_carbon_g)
+    assert masked.makespan_s == pytest.approx(thr.makespan_s)
+
+
+def test_masked_throttle_matches_threshold_throttle() -> None:
+    """Masking off the dirty window with an off_cap (throttle) reproduces the
+    threshold throttle policy."""
+    thr = simulate_policy(
+        _PROFILE, name="throttle", clean_cap_w=300.0, dirty_cap_w=200.0, **_KW,
+    )
+    masked = simulate_masked_policy(
+        _PROFILE, name="throttle", active_mask=[1, 0], full_cap_w=300.0, off_cap_w=200.0,
+        total_iters=1000, window_s=10.0, schedule_g=_SCHED,
+    )
+    assert masked.total_carbon_g == pytest.approx(thr.total_carbon_g)
+    assert masked.makespan_s == pytest.approx(thr.makespan_s)
+
+
+def test_masked_pause_vs_throttle_same_mask_isolates_mechanism() -> None:
+    """Same dirty-window mask, two responses: pause defers (more makespan, no
+    active dirty energy) while throttle keeps training at the lean cap. This is
+    the head-to-head axis — the mask (decision rule) is held fixed."""
+    mask = [1, 0]
+    kw = dict(total_iters=1000, window_s=10.0, schedule_g=_SCHED, active_mask=mask, full_cap_w=300.0)
+    pause = simulate_masked_policy(_PROFILE, name="pause", off_cap_w=None, idle_power_w=0.0, **kw)
+    throttle = simulate_masked_policy(_PROFILE, name="throttle", off_cap_w=200.0, **kw)
+    # pause never burns active energy in the dirty window; throttle does (at 200 W).
+    assert pause.makespan_s > throttle.makespan_s
+    # both complete the work
+    assert pause.iters >= 1000 and throttle.iters >= 1000
+
+
+def test_masked_empty_mask_raises() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        simulate_masked_policy(
+            _PROFILE, name="x", active_mask=[], full_cap_w=300.0,
+            total_iters=10, window_s=10.0, schedule_g=_SCHED,
+        )

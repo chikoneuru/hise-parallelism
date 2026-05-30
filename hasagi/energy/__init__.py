@@ -58,6 +58,7 @@ from hasagi.energy.throttle_pareto import (
     PolicyResult,
     PowerCapProfile,
     pareto,
+    simulate_masked_policy,
     simulate_policy,
 )
 from hasagi.energy.trace_schedule import (
@@ -128,6 +129,7 @@ __all__ = [
     "regime_breakdown",
     "regime_carbon",
     "rotate",
+    "simulate_masked_policy",
     "simulate_policy",
     "synthetic_solar_trace",
     "trace_to_hourly",

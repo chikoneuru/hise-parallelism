@@ -21,6 +21,7 @@ makespan, i.e. the carbon-vs-latency Pareto.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -137,6 +138,81 @@ def simulate_policy(
             carbon_g += resume_energy_kwh * intensity
         paused_last = False
         # Train at this cap for the window, or less if we finish mid-window.
+        iters_full = pt.throughput_iters_s * window_s
+        iters_this = min(iters_full, total_iters - iters)
+        wall_this = iters_this / pt.throughput_iters_s if pt.throughput_iters_s > 0 else window_s
+        e_kwh = iters_this * pt.energy_per_iter_kwh
+        active_kwh += e_kwh
+        carbon_g += e_kwh * intensity
+        iters += int(round(iters_this))
+        makespan_s += wall_this
+    return PolicyResult(
+        name=name, total_carbon_g=carbon_g, makespan_s=makespan_s, iters=iters,
+        active_energy_kwh=active_kwh, idle_carbon_g=idle_carbon_g,
+        resume_carbon_g=resume_carbon_g,
+    )
+
+
+def simulate_masked_policy(
+    profile: PowerCapProfile,
+    *,
+    name: str,
+    total_iters: int,
+    window_s: float,
+    schedule_g: list[float],
+    active_mask: Sequence[int],
+    full_cap_w: float,
+    off_cap_w: float | None = None,
+    resume_energy_kwh: float = 0.0,
+    idle_power_w: float = 0.0,
+    max_windows: int = 100_000,
+) -> PolicyResult:
+    """Forward-simulate one policy whose per-window response is a precomputed mask.
+
+    Unlike :func:`simulate_policy` (which decides dirty/clean from a scalar
+    ``threshold_g``), the response here is dictated by ``active_mask`` — a 0/1
+    series aligned to ``schedule_g`` and cycled with it. A ``1`` runs the window
+    at ``full_cap_w``. A ``0`` is the carbon response: PAUSE (defer the work, pay
+    ``resume_energy_kwh`` on the next active window and bill ``idle_power_w`` over
+    the window) when ``off_cap_w is None``, or THROTTLE to ``off_cap_w`` and keep
+    training otherwise.
+
+    This lets an external decision rule — e.g. a rolling-window percentile mask
+    that uses no lookahead — drive the same measured-energy substrate as the
+    threshold policies. Holding the energy model and a given mask fixed, a
+    head-to-head between two responses on that mask reflects the pause-vs-throttle
+    difference; it does not by itself disentangle that difference from the
+    cap-efficiency a throttle banks on the off-windows (see the carbon-signal
+    decomposition in the real-trace experiment for that).
+    """
+    if not active_mask:
+        raise ValueError("active_mask must be non-empty")
+    iters = 0
+    carbon_g = 0.0
+    active_kwh = 0.0
+    idle_carbon_g = 0.0
+    resume_carbon_g = 0.0
+    makespan_s = 0.0
+    paused_last = False
+    w = 0
+    while iters < total_iters and w < max_windows:
+        intensity = schedule_g[w % len(schedule_g)]
+        active = active_mask[w % len(active_mask)]
+        w += 1
+        if not active and off_cap_w is None:
+            # Pause: defer this window's work; bill idle power for the regime.
+            idle_kwh = idle_power_w * window_s / 3_600_000.0
+            idle_carbon_g += idle_kwh * intensity
+            carbon_g += idle_kwh * intensity
+            makespan_s += window_s
+            paused_last = True
+            continue
+        cap = off_cap_w if (not active and off_cap_w is not None) else full_cap_w
+        pt = profile.point(cap)
+        if paused_last and resume_energy_kwh > 0.0:
+            resume_carbon_g += resume_energy_kwh * intensity
+            carbon_g += resume_energy_kwh * intensity
+        paused_last = False
         iters_full = pt.throughput_iters_s * window_s
         iters_this = min(iters_full, total_iters - iters)
         wall_this = iters_this / pt.throughput_iters_s if pt.throughput_iters_s > 0 else window_s
