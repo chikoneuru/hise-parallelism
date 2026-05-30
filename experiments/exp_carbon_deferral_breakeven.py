@@ -78,14 +78,23 @@ def _run_policy(
     tick_seconds: float,
     pool: KnativePool | None,
     max_ticks: int,
+    sample_background: bool = True,
 ) -> dict:
     """Run one policy to completion (``total_iters``); return its ledger + stats.
 
     ``threshold = inf`` makes the policy never pause (the always-on baseline).
     Energy is NOT integrated online here: the ledger records phase marks with
-    timestamps, and a background anchor is sampled whenever our job is off the
-    GPU (before the first start, at each pause, and after completion). The caller
-    re-integrates the recorded device trace against the time-varying background.
+    timestamps, and the caller re-integrates the recorded device trace against a
+    background model.
+
+    ``sample_background`` controls how that background is built. With it True
+    (shared GPU), an anchor is sampled whenever our job is off the GPU. But once
+    our process has created a CUDA context it never releases it across pauses
+    (the pod scales to zero; the host process persists), so on a *dedicated* GPU
+    those "idle" anchors read our own held-context power, not a co-tenant — which
+    is OUR energy and must not be subtracted. There, pass ``sample_background``
+    False and pre-seed ``bg_model`` with the true idle floor (measured before any
+    context exists); the held-context power then correctly lands in our idle phase.
     """
     console.print(f"[bold]Policy: {name}[/] (target {total_iters} iters)")
     trainer = HostTrainer(ckpt_path=ckpt_path)
@@ -95,7 +104,8 @@ def _run_policy(
     pauses = 0
     ticks = 0
 
-    bg_model.add(time.monotonic(), meter.sample_power_w())   # pre-run bracket (job off GPU)
+    if sample_background:
+        bg_model.add(time.monotonic(), meter.sample_power_w())   # pre-run bracket (job off GPU)
     t0 = time.monotonic()
 
     while trainer.iters_done < total_iters and ticks < max_ticks:
@@ -125,11 +135,11 @@ def _run_policy(
                 pauses += 1
             ledger.mark(PHASE_IDLE, intensity)
             time.sleep(tick_seconds)
-            # Anchor the background only AFTER the idle window settles: sampling
-            # right at teardown reads an elevated draw (the process still holds
-            # the CUDA context and the clocks have not yet dropped), which would
-            # over-estimate the background near adjacent active windows.
-            bg_model.add(time.monotonic(), meter.sample_power_w())
+            if sample_background:
+                # Shared-GPU only: re-anchor the (co-tenant) background. On a
+                # dedicated GPU this reading is our own held context, not
+                # background, so it is skipped (see the docstring).
+                bg_model.add(time.monotonic(), meter.sample_power_w())
 
     makespan_s = time.monotonic() - t0
     if running:
@@ -139,7 +149,8 @@ def _run_policy(
         pool.scale(target=0, timeout_seconds=10.0, wait_for_ready=False)
     time.sleep(_SETTLE_S)                         # let clocks drop before bracketing
     end_s = time.monotonic()
-    bg_model.add(end_s, meter.sample_power_w())   # post-run bracket (job off GPU)
+    if sample_background:
+        bg_model.add(end_s, meter.sample_power_w())   # post-run bracket (job off GPU)
     console.print(
         f"  done: {trainer.iters_done} iters in {ticks} ticks, {pauses} pause(s), "
         f"makespan {makespan_s:.1f}s"
@@ -188,11 +199,23 @@ def run(args: argparse.Namespace) -> int:
 
     meter = MarginalEnergyMeter(device_index=args.device, poll_interval_ms=100, record_trace=True)
     bg_cal, bg_sd = meter.calibrate(seconds=args.calibrate_s)
-    console.print(
-        f"[bold]Background[/]: {bg_cal:.1f} W (sd {bg_sd:.1f} W) at calibration; "
-        f"tracked continuously via brackets + pause anchors."
-    )
-    bg_model = BackgroundModel()
+    # Dedicated GPU: subtract a CONSTANT true-idle floor (our held CUDA context
+    # during pauses is our energy, not background, so it must not be re-sampled).
+    # Shared GPU: track the co-tenant background via brackets + pause anchors.
+    fixed_bg = args.fixed_background_w
+    sample_bg = fixed_bg is None
+    if sample_bg:
+        bg_model = BackgroundModel()
+        console.print(
+            f"[bold]Background[/]: {bg_cal:.1f} W (sd {bg_sd:.1f} W) at calibration; "
+            f"tracking the shared-GPU background via brackets + pause anchors."
+        )
+    else:
+        bg_model = BackgroundModel([(0.0, fixed_bg)])
+        console.print(
+            f"[bold]Background[/]: constant {fixed_bg:.1f} W true-idle floor (dedicated GPU); "
+            f"held-context power during pauses is billed to us, not subtracted."
+        )
     meter.start()
 
     pool = None if args.no_drive_pod else KnativePool(service=args.service, namespace=args.namespace)
@@ -201,13 +224,13 @@ def run(args: argparse.Namespace) -> int:
             console, "always-on", ckpt_path="./artifacts/deferral_base_ckpt.pt",
             meter=meter, bg_model=bg_model, schedule=schedule, threshold=math.inf,
             total_iters=args.total_iters, tick_seconds=args.tick_seconds,
-            pool=pool, max_ticks=args.max_ticks,
+            pool=pool, max_ticks=args.max_ticks, sample_background=sample_bg,
         )
         aware = _run_policy(
             console, "carbon-aware", ckpt_path="./artifacts/deferral_aware_ckpt.pt",
             meter=meter, bg_model=bg_model, schedule=schedule, threshold=args.threshold,
             total_iters=args.total_iters, tick_seconds=args.tick_seconds,
-            pool=pool, max_ticks=args.max_ticks,
+            pool=pool, max_ticks=args.max_ticks, sample_background=sample_bg,
         )
     finally:
         meter.stop()
@@ -324,6 +347,9 @@ def main() -> int:
     p.add_argument("--max-ticks", type=int, default=400,
                    help="Safety cap so an over-aggressive threshold cannot loop forever.")
     p.add_argument("--calibrate-s", type=float, default=6.0)
+    p.add_argument("--fixed-background-w", type=float, default=None,
+                   help="Subtract a CONSTANT idle floor (W) instead of tracking a shared-GPU "
+                        "background. Use the measured true-idle floor on a dedicated GPU.")
     p.add_argument("--dedicated-idle-w", type=float, default=26.0,
                    help="Idle floor charged in the dedicated regime; measure on a clean GPU.")
     p.add_argument("--out", default=None)
