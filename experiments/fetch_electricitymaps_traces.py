@@ -78,10 +78,10 @@ def list_zones(base_url: str) -> dict:
     return _request(f"{base_url}/zones", token=None)
 
 
-def fetch_past_range(
+def _past_range_one(
     base_url: str, token: str, em_zone: str, start: datetime, end: datetime,
 ) -> list[tuple[datetime, float]]:
-    """Hourly (datetime, carbonIntensity gCO2eq/kWh LCA) for one EM zone over [start, end)."""
+    """One past-range request (the endpoint caps the window length, so callers chunk)."""
     params = {
         "zone": em_zone,
         "start": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -97,8 +97,29 @@ def fetch_past_range(
             continue
         t = datetime.fromisoformat(raw_t.replace("Z", "+00:00")).astimezone(UTC)
         rows.append((t, float(ci)))
-    rows.sort(key=lambda r: r[0])
     return rows
+
+
+def fetch_past_range(
+    base_url: str, token: str, em_zone: str, start: datetime, end: datetime,
+    chunk_days: int = 10,
+) -> list[tuple[datetime, float]]:
+    """Hourly (datetime, carbonIntensity gCO2eq/kWh LCA) for one EM zone over [start, end).
+
+    The past-range endpoint rejects windows longer than ~10 days (HTTP 400), so
+    the range is fetched in ``chunk_days`` slices and concatenated (deduped by
+    timestamp at the chunk boundaries).
+    """
+    from datetime import timedelta
+
+    merged: dict[datetime, float] = {}
+    cur = start
+    while cur < end:
+        nxt = min(cur + timedelta(days=chunk_days), end)
+        for t, v in _past_range_one(base_url, token, em_zone, cur, nxt):
+            merged[t] = v
+        cur = nxt
+    return sorted(merged.items())
 
 
 def write_csv(path: Path, zone_id: str, em_zone: str, rows: list[tuple[datetime, float]]) -> None:
@@ -152,7 +173,7 @@ def run(args: argparse.Namespace) -> int:
         em_zone = ZONE_MAP.get(zone, zone)
         print(f"  {zone:6s} ({em_zone}): …", end="", flush=True)
         try:
-            rows = fetch_past_range(base_url, token, em_zone, start, end)
+            rows = fetch_past_range(base_url, token, em_zone, start, end, chunk_days=args.chunk_days)
         except urllib.error.HTTPError as e:
             hint = ""
             if e.code in (401, 403):
@@ -191,6 +212,8 @@ def main() -> int:
                    help="Override zone ids, e.g. --map BR=BR-S AU=AU-QLD.")
     p.add_argument("--list-zones", action="store_true",
                    help="List EM zone ids (no auth) and check the ZONE_MAP; do not fetch.")
+    p.add_argument("--chunk-days", type=int, default=10,
+                   help="Max days per past-range request; the endpoint rejects ~>10-day windows.")
     p.add_argument("--rate-limit-sleep-s", type=float, default=2.0)
     return run(p.parse_args())
 
