@@ -8,8 +8,8 @@ validated end-to-end -- the only clean end-to-end run was at 200 W, where the
 policy is carbon-POSITIVE; (b) the 16-zone x 3-seed design is pseudo-replicated
 (seeds share one synthetic diurnal phase, effective N is ~3); (c) the carbon
 traces are synthetic, not real. Kept only as an unvalidated record. A real
-250 W end-to-end run + clustered statistics + real traces are required before
-any BERT carbon number can be reported. See docs/checklist-current.md (P0).
+end-to-end run at the reported throttle cap, zone-clustered statistics, and
+real carbon traces are required before any BERT carbon number can be reported.
 =========================================================================
 
 A carbon-aware policy's per-hour decision (``train_at_max`` /
