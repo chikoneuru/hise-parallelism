@@ -53,12 +53,20 @@ from hasagi.energy.telemetry import (
     TelemetrySource,
     WorkerTelemetry,
 )
+from hasagi.energy.throttle_pareto import (
+    CapPoint,
+    PolicyResult,
+    PowerCapProfile,
+    pareto,
+    simulate_policy,
+)
 
 __all__ = [
     "OBSERVATION_DIM",
     "AggregateCarbonReading",
     "AggregateTelemetrySource",
     "BackgroundModel",
+    "CapPoint",
     "CarbonReading",
     "CarbonSource",
     "CarbonTrace",
@@ -79,11 +87,13 @@ __all__ = [
     "PHASE_IDLE",
     "PhaseInterval",
     "PodEnergyLedger",
+    "PolicyResult",
     "RegimeCarbon",
     "PPOAction",
     "PPOObservation",
     "PPOScalingPolicy",
     "PowerAwareRulePolicy",
+    "PowerCapProfile",
     "PrometheusPusher",
     "RaplTelemetrySource",
     "RuleBasedPolicy",
@@ -97,7 +107,9 @@ __all__ = [
     "load_csv_trace",
     "marginal_kwh_from_trace",
     "nvml_cumulative_kwh_fn",
+    "pareto",
     "regime_breakdown",
     "regime_carbon",
+    "simulate_policy",
     "synthetic_solar_trace",
 ]
