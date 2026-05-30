@@ -1,8 +1,8 @@
 """What happens to the freed GPU decides whether carbon-aware pause wins.
 
-WS0 measured a paused job on a *shared* card and (with marginal attribution)
-found its idle cost is ~0 — because the co-tenant draws the idle either way.
-But that is only one of three regimes for the GPU a paused job releases:
+A paused job on a *shared* card, measured with marginal attribution, has an idle
+cost of ~0 — the co-tenant draws the idle either way. But that is only one of
+three regimes for the GPU a paused job releases:
 
   - ``dedicated``    — the card stays ours and idles. We are billed its idle
                        floor for the whole pause, at the (dirty) pause-window

@@ -1,7 +1,7 @@
-"""Carbon-policy Pareto over REAL grid traces (ElectricityMaps DE / NO).
+"""Carbon-policy Pareto over REAL grid traces (ElectricityMaps zones).
 
 Replaces the synthetic 200/900 pattern with real hourly carbon-intensity traces
-and feeds them into the WS1 throttle-vs-pause-vs-always-on Pareto (driven by the
+and feeds them into the throttle-vs-pause-vs-always-on Pareto (driven by the
 measured power-cap profile). For each zone the job is run from many staggered
 diurnal start offsets — genuinely different real-day realisations — so the start
 offset is the replication unit, decoupled from a single fixed diurnal phase
@@ -191,8 +191,8 @@ def run(args: argparse.Namespace) -> int:
             f"The rest are synthetic placeholders (tagged). Drop <zone>_*.csv into {args.real_dir}.[/]"
         )
     console.print(
-        "[dim]Replication: distinct real-day diurnal offsets within a zone (not the eff-N≈3 "
-        "single-phase pitfall); cross-zone clusters by zone over the REAL zones only.[/]"
+        "[dim]Replication: distinct real-day diurnal offsets within a zone (independent samples, "
+        "not a single shared diurnal phase); cross-zone clusters by zone over the REAL zones only.[/]"
     )
 
     if args.out:

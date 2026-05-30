@@ -1,6 +1,6 @@
 """Turn a real carbon trace into schedules for the carbon-policy simulators.
 
-The WS1 Pareto/deferral simulators take a per-window intensity list cycled over
+The Pareto/deferral simulators take a per-window intensity list cycled over
 time. This adapts a real ``CarbonTrace`` (e.g. an ElectricityMaps zone export)
 into that form, and — crucially for honest statistics — yields multiple
 schedules that start at *different* points in the diurnal cycle.
